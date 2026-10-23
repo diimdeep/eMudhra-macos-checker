@@ -29,8 +29,10 @@ python3 checking/check_trust.py --json          # write checking/report.json
 | `--chains PATH` | alternate chain directory or zip |
 | `--json [PATH]` | write results as JSON (default `checking/report.json`) |
 | `--deep` | scan each Electron binary for the embedded roots |
+| `--scan DIR` | also look for certifi copies under DIR (repeatable; home is always scanned) |
 | `--top N` | test only the first N chains (debugging) |
 | `--timeout S` | per-probe timeout (default 8) |
+| `--no-progress` | do not draw the progress line (it is off anyway when stderr is not a terminal) |
 
 
 ## How it works
@@ -69,13 +71,14 @@ had both.
 ## Reading the output
 
 ```
-TECH                     VERSION   STORE                        TEST       RESULT
-Java <ver> (<vendor>)    ...       JDK cacerts                  handshake  rejects 0/12
-curl                     ...       /etc/ssl/cert.pem            handshake  rejects 0/12
-NSS                      ...       libnssckbi (built-in roots)  version    patched
-Electron                 N apps    Chromium + CRLSets           version    outdated
-macOS Security.framework ...       System keychain              keychain    rejects 0/12
+TECH                     VERSION   TEST      RESULT       STORE
+Java <ver> (<vendor>)    ...       handshake rejects 0/12 /Library/Java/JavaVirtualMachines/<jdk>/Contents/Home/lib/security/cacerts
+curl                     ...       handshake rejects 0/12 /etc/ssl/cert.pem
+NSS                      ...       version   patched      libnssckbi (built-in roots)
+Electron                 N apps    version   outdated     Chromium root store + CRLSets
+macOS Security.framework ...       keychain  rejects 0/12 System keychain
 ```
+
 
 `TEST` is how the row was decided: `handshake` (strongest), `bundle`,
 `version` (version only), `keychain` (CA tested under Apple's SSL policy),
@@ -149,8 +152,9 @@ certifi package directory or a bare PEM bundle (which replaces only
 * `serve_lab.py` — keeps the lab up for the Sublime plugin.
 * `sublime/local_trust_check.py` — the plugin.
 * `patch_sublime.py` — swaps Sublime's certifi, re-signs ad-hoc.
+* `progress.py` — the one-line progress display on stderr.
+* `apps.py` — finds app bundles, including ones in subfolders, and the CA files inside them.
 * `patched_versions.json` — fixed releases from the disclosure.
-* `test_check_trust.py` — unit tests: `python3 -m unittest checking/test_check_trust.py`.
 * `report.json` — last JSON result, written on `--json`.
 
 ## Adding a client

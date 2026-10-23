@@ -1,0 +1,85 @@
+"""Live progress display on stderr.
+
+    / [14/37] java       3.4s  handshakes 5/12  /Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home
+
+A background thread redraws the line ten times a second so the spinner and
+the clock move while a slow probe (a JVM start, a Spotlight query) runs.
+Paths are never cut: when the text is wider than the terminal it wraps, and
+the next redraw moves the cursor back up over every row it used.  Disabled
+when stderr is not a terminal, so piped and redirected output stay clean.
+"""
+
+from __future__ import annotations
+
+import math
+import shutil
+import sys
+import threading
+import time
+
+SPINNER = "|/-\\"
+
+
+class Progress:
+    def __init__(self) -> None:
+        self.enabled = False
+        self._lock = threading.Lock()
+        self._step = ""
+        self._detail = ""
+        self._started = time.monotonic()
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._tick = 0
+        self._rows = 0  # terminal rows the last draw occupied
+
+    def start(self, enabled: bool | None = None) -> None:
+        self.enabled = sys.stderr.isatty() if enabled is None else enabled
+        self._started = time.monotonic()
+        if not self.enabled or self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def step(self, index: int, total: int, label: str) -> None:
+        width = len(str(total))
+        with self._lock:
+            self._step = f"[{index:>{width}}/{total}] {label:<9}"
+            self._detail = ""
+
+    def detail(self, text: str) -> None:
+        with self._lock:
+            self._detail = text
+
+    def done(self) -> None:
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(1)
+            self._thread = None
+        if self.enabled:
+            sys.stderr.write(self._rewind())
+            sys.stderr.flush()
+            self._rows = 0
+
+    def _rewind(self) -> str:
+        """Back to the first row of the previous draw, then clear below."""
+        up = f"\033[{self._rows - 1}A" if self._rows > 1 else ""
+        return f"\r{up}\033[J"
+
+    def _run(self) -> None:
+        while not self._stop.wait(0.1):
+            self._draw()
+
+    def _draw(self) -> None:
+        with self._lock:
+            step, detail = self._step, self._detail
+        self._tick += 1
+        clock = f"{time.monotonic() - self._started:5.1f}s"
+        columns = max(shutil.get_terminal_size((100, 20)).columns, 1)
+        text = f"{SPINNER[self._tick % len(SPINNER)]} {step} {clock}  {detail}".rstrip()
+        sys.stderr.write(self._rewind() + text)
+        sys.stderr.flush()
+        self._rows = max(1, math.ceil(len(text) / columns))
+
+
+progress = Progress()

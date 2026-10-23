@@ -41,7 +41,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -50,7 +50,9 @@ ROOT = HERE.parent
 CACHE = HERE / ".cache"
 sys.path.insert(0, str(HERE))
 
+from apps import APP_ROOTS, app_bundles, ca_files  # noqa: E402
 from lab import Lab, LabError, resolve_chains, split_pem, sweep_stale  # noqa: E402
+from progress import progress  # noqa: E402
 
 VERSION = "1.0"
 
@@ -228,7 +230,8 @@ REJECT_RE = re.compile(
     r"|verify error|Verification error|unable to get local issuer"
     r"|PKIX path|ValidatorException|CertPathBuilderException|CertificateException"
     r"|x509:|failed to verify certificate|not standards compliant"
-    r"|UNABLE_TO_|SELF_SIGNED|CERT_|DEPTH_ZERO|ERR_TLS_CERT",
+    r"|UNABLE_TO_|SELF_SIGNED|CERT_|DEPTH_ZERO|ERR_TLS_CERT"
+    r"|invalid peer certificate|UnknownIssuer",
 )
 
 
@@ -315,6 +318,59 @@ def p_bun(chain, timeout):
     return classify(ok, first_line(r.out) or first_line(r.err))
 
 
+DENO_SCRIPT = """
+try {
+  const r = await fetch(Deno.args[0]);
+  console.log('OK', r.status);
+} catch (e) {
+  console.log('ERR', String(e.cause ?? e).split('\\n')[0]);
+  Deno.exit(1);
+}
+"""
+
+
+def deno_bin() -> str | None:
+    found = shutil.which("deno")
+    if found:
+        return found
+    default = Path.home() / ".deno" / "bin" / "deno"
+    return str(default) if default.is_file() else None
+
+
+def p_deno(chain, timeout):
+    binary = deno_bin()
+    if binary is None:
+        return None, "deno not found"
+    script = CACHE / "helpers" / "deno_fetch.ts"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    if not script.is_file():
+        script.write_text(DENO_SCRIPT)
+    env = os.environ.copy()
+    env["NO_COLOR"] = "1"
+    r = sh([binary, "run", "--allow-net", "--quiet", str(script), chain.url],
+           timeout=timeout + 10, env=env)
+    return classify(r.out.startswith("OK"), first_line(r.out) or first_line(r.err))
+
+
+PY_PROBE = (
+    "import socket, ssl, sys\n"
+    "cafile = sys.argv[2] if len(sys.argv) > 2 else None\n"
+    "try:\n"
+    "    ctx = ssl.create_default_context(cafile=cafile)\n"
+    "    s = socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=8)\n"
+    "    ctx.wrap_socket(s, server_hostname='localhost').close()\n"
+    "    print('OK')\n"
+    "except Exception as e:\n"
+    "    print('ERR', type(e).__name__ + ':', e)\n"
+)
+
+
+def p_interpreter(python: str, chain, timeout, cafile: str | None = None):
+    cmd = [python, "-I", "-c", PY_PROBE, str(chain.port)] + ([cafile] if cafile else [])
+    r = sh(cmd, timeout=timeout + 8)
+    return classify(r.out.startswith("OK"), first_line(r.out) or first_line(r.err))
+
+
 def p_ruby(chain, timeout):
     script = (
         "require 'net/http'; require 'uri'; "
@@ -392,6 +448,7 @@ class Helpers:
             self.dir.mkdir(parents=True, exist_ok=True)
             src = self.dir / "HttpsCheck.java"
             src.write_text(JAVA_SRC)
+            progress.detail("compiling the Java probe")
             # Java 8 homes are the likeliest to still carry the AAA root, so
             # the class file has to load there too.
             r = sh(["javac", "--release", "8", "-Xlint:-options", "-d", str(self.dir), str(src)],
@@ -416,6 +473,7 @@ class Helpers:
             env = os.environ.copy()
             env["GOCACHE"] = str(self.cache / "go-build")
             env["GOTOOLCHAIN"] = "local"
+            progress.detail("building the Go probe")
             r = sh(["go", "build", "-o", "gohttp", "."], timeout=120, env=env, cwd=gdir)
             if r.rc != 0:
                 self.go_error = first_line(r.err)
@@ -465,6 +523,9 @@ class Ctx:
         self._java: dict[str, Summary] = {}
         self._lock = threading.Lock()
         self.memo: dict[str, Result] = {}
+        # bundles already reported by a named row, so the venv scan skips them
+        self.covered: set[Path] = set()
+        self.scan_roots = [Path.home()] + [Path(p).expanduser() for p in (args.scan or [])]
         disclosure = Path(args.disclosure).expanduser().resolve() if args.disclosure else None
         self.patched_rows, self.patched = load_patched(disclosure)
 
@@ -474,7 +535,9 @@ class Ctx:
         CACHE.mkdir(parents=True, exist_ok=True)
         self.lab = Lab(ROOT, CACHE, self.openssl, keys=getattr(self.args, "keys", None))
         files = self.chain_files if self.limited else None
+        progress.detail("minting localhost leaves under the recovered keys")
         self.lab.prepare(self.chains_dir, files=files)
+        progress.detail(f"starting {len(self.lab.chains)} loopback servers")
         self.servers = self.lab.start()
         return self.servers
 
@@ -488,7 +551,9 @@ class Ctx:
 
     def bundle_counts(self, bundle: Path) -> tuple[int, int]:
         accepted = 0
-        for chain in self.chain_files:
+        total = len(self.chain_files)
+        for i, chain in enumerate(self.chain_files, 1):
+            progress.detail(f"openssl verify {i}/{total}  {bundle}")
             r = sh([self.openssl, "verify", "-CAfile", str(bundle),
                     "-untrusted", str(chain), str(chain)], timeout=15)
             if r.rc == 0:
@@ -513,6 +578,7 @@ class Ctx:
             "node": p_node,
             "bun": p_bun,
             "ruby": p_ruby,
+            "deno": p_deno,
         }
         # Java is absent on purpose: t_java tests every JVM home separately.
         if self.helpers.ensure_go():
@@ -520,12 +586,14 @@ class Ctx:
 
         tasks = [(name, fn, chain) for name, fn in clients.items() for chain in self.servers]
         results: dict[str, list] = {name: [] for name in clients}
+        names = ", ".join(clients)
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {
                 pool.submit(fn, chain, self.timeout): (name, chain)
                 for name, fn, chain in tasks
             }
-            for fut in futures:
+            for done, fut in enumerate(as_completed(futures), 1):
+                progress.detail(f"handshakes {done}/{len(tasks)}  {names}")
                 name, chain = futures[fut]
                 try:
                     ok, detail = fut.result()
@@ -536,6 +604,27 @@ class Ctx:
         self._local = {name: summarize(values) for name, values in results.items()}
         return self._local
 
+    def run_probe(self, probe, label: str = "") -> Summary:
+        """Run `probe(chain, timeout)` against every lab chain."""
+        values = []
+        total = len(self.servers)
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = [pool.submit(probe, chain, self.timeout) for chain in self.servers]
+            progress.detail(f"handshakes 0/{total}  {label}")
+            for done, fut in enumerate(as_completed(futures), 1):
+                progress.detail(f"handshakes {done}/{total}  {label}")
+                try:
+                    values.append(fut.result())
+                except Exception as exc:  # noqa: BLE001
+                    values.append((None, f"{type(exc).__name__}: {exc}"))
+        return summarize(values)
+
+    def bundle_result(self, key: str, name: str, bundle: Path, **kw) -> Result:
+        self.covered.add(bundle.resolve())
+        accepted, total = self.bundle_counts(bundle)
+        return Result(key, name, store=str(bundle), method="openssl verify -CAfile",
+                      accepted=accepted, total=total, **kw)
+
     def java_local(self, home: Path, classes: Path) -> Summary:
         """Handshake results for one specific JVM, cached per home."""
         key = str(home)
@@ -544,10 +633,13 @@ class Ctx:
         if cached is not None:
             return cached
         values = []
+        total = len(self.servers)
         with ThreadPoolExecutor(max_workers=6) as pool:
             futures = [pool.submit(probe_java_home, home, chain, self.timeout, classes)
                        for chain in self.servers]
-            for fut in futures:
+            progress.detail(f"handshakes 0/{total}  {home}")
+            for done, fut in enumerate(as_completed(futures), 1):
+                progress.detail(f"handshakes {done}/{total}  {home}")
                 try:
                     values.append(fut.result())
                 except Exception as exc:  # noqa: BLE001
@@ -697,6 +789,7 @@ def t_certifi(ctx: Ctx) -> Result:
         import certifi
     except ImportError:
         return Result("certifi", "Python certifi", installed=False)
+    ctx.covered.add(Path(certifi.where()).resolve())
     local = ctx.local().get("certifi") if ctx.mode == "local" else None
     if local:
         accepted, total, detail, errors = local
@@ -718,6 +811,7 @@ def t_pip(ctx: Ctx) -> Result:
              "import pip._vendor.certifi as c; print(c.where())"], timeout=20)
     bundle = first_line(r2.out)
     if bundle and Path(bundle).is_file():
+        ctx.covered.add(Path(bundle).resolve())
         accepted, total = ctx.bundle_counts(Path(bundle))
         return Result("pip", "pip", version=version, store=bundle,
                       method="openssl verify on vendored certifi",
@@ -791,6 +885,24 @@ def t_bun(ctx: Ctx) -> Result:
                       total=total, note=detail, group="runtime")
     return Result("bun", "Bun", version=version, store="BoringSSL, compiled-in roots",
                   method="version only", group="runtime")
+
+
+def t_deno(ctx: Ctx) -> Result:
+    binary = deno_bin()
+    if binary is None:
+        return Result("deno", "Deno", installed=False)
+    version = first_line(sh([binary, "-V"], timeout=10).out).split(" ")[-1]
+    system = "system" in os.environ.get("DENO_TLS_CA_STORE", "")
+    store = "macOS keychain (DENO_TLS_CA_STORE)" if system else "compiled-in Mozilla roots"
+    note = "" if system else "DENO_TLS_CA_STORE=system makes Deno use the macOS keychain"
+    local = ctx.local().get("deno") if ctx.mode == "local" else None
+    if local:
+        accepted, total, detail, errors = local
+        return Result("deno", "Deno", version=version, store=store,
+                      method="live handshake, local lab", accepted=accepted, errors=errors,
+                      total=total, note=detail if not accepted else note, group="runtime")
+    return Result("deno", "Deno", version=version, store=store, method="version only",
+                  note=note, group="runtime")
 
 
 def t_go(ctx: Ctx) -> Result:
@@ -881,6 +993,7 @@ def export_cacerts(home: Path, cache: Path) -> Path | None:
 
 
 def t_java(ctx: Ctx) -> list[Result]:
+    progress.detail("looking for JVMs")
     homes = java_homes()
     if not homes:
         return [Result("java", "Java", installed=False)]
@@ -969,7 +1082,14 @@ def read_plist(path: Path) -> dict:
         return {}
 
 
-ELECTRON_ROOTS = ("/Applications", "/Applications/Utilities")
+def app_label(app: Path) -> str:
+    """`AnyTrans` for a top-level app, `iphone/AnyTrans` for one in a folder."""
+    for root in APP_ROOTS:
+        try:
+            return str(app.relative_to(root).with_suffix(""))
+        except ValueError:
+            continue
+    return app.stem
 
 
 ROOT_MARKERS = {
@@ -996,46 +1116,38 @@ def count_marker(path: Path, needle: bytes, chunk: int = 8 << 20) -> int:
 
 
 def electron_apps(deep: bool = False) -> list[dict]:
-    """Every .app in the usual places that embeds the Electron framework."""
-    roots = [Path(p) for p in ELECTRON_ROOTS] + [Path.home() / "Applications"]
+    """Every app bundle that embeds the Electron framework."""
     found: list[dict] = []
-    seen: set[Path] = set()
-    for root in roots:
-        if not root.is_dir():
+    for app in app_bundles():
+        framework = app / "Contents" / "Frameworks" / "Electron Framework.framework"
+        if not framework.is_dir():
             continue
-        for app in sorted(root.glob("*.app")):
-            resolved = app.resolve()
-            if resolved in seen:
+        framework_version = ""
+        for candidate in (
+            framework / "Versions" / "A" / "Resources" / "Info.plist",
+            framework / "Versions" / "Current" / "Resources" / "Info.plist",
+            framework / "Resources" / "Info.plist",
+        ):
+            if not candidate.is_file():
                 continue
-            seen.add(resolved)
-            framework = app / "Contents" / "Frameworks" / "Electron Framework.framework"
-            if not framework.is_dir():
-                continue
-            framework_version = ""
-            for candidate in (
-                framework / "Versions" / "A" / "Resources" / "Info.plist",
-                framework / "Versions" / "Current" / "Resources" / "Info.plist",
-                framework / "Resources" / "Info.plist",
-            ):
-                if not candidate.is_file():
-                    continue
-                info = read_plist(candidate)
-                framework_version = (info.get("CFBundleVersion")
-                                     or info.get("CFBundleShortVersionString") or "")
-                if framework_version:
-                    break
-            meta = read_plist(app / "Contents" / "Info.plist")
-            entry = {
-                "name": meta.get("CFBundleName") or app.stem,
-                "app_version": meta.get("CFBundleShortVersionString", ""),
-                "electron": framework_version,
-                "path": str(app),
-            }
-            if deep:
-                binary = framework / "Versions" / "A" / "Electron Framework"
-                entry["roots"] = {name: count_marker(binary, marker)
-                                  for name, marker in ROOT_MARKERS.items()}
-            found.append(entry)
+            info = read_plist(candidate)
+            framework_version = (info.get("CFBundleVersion")
+                                 or info.get("CFBundleShortVersionString") or "")
+            if framework_version:
+                break
+        meta = read_plist(app / "Contents" / "Info.plist")
+        entry = {
+            "name": app_label(app),
+            "app_version": meta.get("CFBundleShortVersionString", ""),
+            "electron": framework_version,
+            "path": str(app),
+        }
+        if deep:
+            progress.detail(f"reading {app_label(app)}'s Electron binary")
+            binary = framework / "Versions" / "A" / "Electron Framework"
+            entry["roots"] = {name: count_marker(binary, marker)
+                              for name, marker in ROOT_MARKERS.items()}
+        found.append(entry)
     return found
 
 
@@ -1070,30 +1182,29 @@ def t_electron(ctx: Ctx) -> Result:
                   verdict=verdict, group="runtime", note=note, items=apps)
 
 
+def certifi_version(package: Path) -> str:
+    init = package / "__init__.py"
+    if not init.is_file():
+        return ""
+    match = re.search(r'__version__\s*=\s*["\']([^"\']+)', init.read_text(errors="replace"))
+    return match.group(1) if match else ""
+
+
 def sublime_installs() -> list[dict]:
     """Sublime Text bundles certifi for its Python plugin host."""
     found: list[dict] = []
-    for base in (Path("/Applications"), Path.home() / "Applications"):
-        if not base.is_dir():
+    for app in app_bundles(pattern="Sublime Text*.app"):
+        bundle = app / "Contents" / "MacOS" / "Lib" / "python3" / "certifi" / "cacert.pem"
+        if not bundle.is_file():
             continue
-        for app in sorted(base.glob("Sublime Text*.app")):
-            bundle = app / "Contents" / "MacOS" / "Lib" / "python3" / "certifi" / "cacert.pem"
-            if not bundle.is_file():
-                continue
-            meta = read_plist(app / "Contents" / "Info.plist")
-            init = bundle.parent / "__init__.py"
-            certifi_version = ""
-            if init.is_file():
-                match = re.search(r'__version__\s*=\s*["\']([^"\']+)',
-                                  init.read_text(errors="replace"))
-                if match:
-                    certifi_version = match.group(1)
-            found.append({
-                "app": str(app),
-                "build": meta.get("CFBundleShortVersionString", ""),
-                "bundle": bundle,
-                "certifi": certifi_version,
-            })
+        meta = read_plist(app / "Contents" / "Info.plist")
+        found.append({
+            "app": str(app),
+            "label": app_label(app),
+            "build": meta.get("CFBundleShortVersionString", ""),
+            "bundle": bundle,
+            "certifi": certifi_version(bundle.parent),
+        })
     return found
 
 
@@ -1103,12 +1214,13 @@ def t_sublime(ctx: Ctx) -> list[Result]:
         return [Result("sublime", "Sublime Text (plugin host)", installed=False)]
     results: list[Result] = []
     for item in installs:
+        ctx.covered.add(item["bundle"].resolve())
         accepted, total = ctx.bundle_counts(item["bundle"])
         note = f"bundled certifi {item['certifi'] or '?'}"
         if sys.platform == "darwin":
             note += "; Package Control itself reads the macOS keychain"
         results.append(Result(
-            "sublime", f"Sublime Text {item['build']} (plugin host)",
+            "sublime", f"{item['label']} {item['build']} (plugin host)",
             version=item["certifi"] or item["build"],
             store=str(item["bundle"]),
             method="openssl verify on bundled certifi",
@@ -1156,6 +1268,151 @@ def t_cfssl(ctx: Ctx) -> Result:
     return Result("cfssl", "Cloudflare CFSSL trust store", group="runtime")
 
 
+def t_app_bundles(ctx: Ctx) -> list[Result]:
+    """CA files shipped inside app bundles (kitty, VCV Rack, AnyTrans, ...).
+
+    Sublime's certifi has its own row; Electron apps use Chromium's store.
+    """
+    results: list[Result] = []
+    bundles = app_bundles()
+    for i, app in enumerate(bundles, 1):
+        progress.detail(f"app {i}/{len(bundles)}  {app_label(app)}")
+        for bundle in ca_files(app):
+            if bundle.resolve() in ctx.covered:
+                continue
+            inner = bundle.relative_to(app)
+            version = certifi_version(bundle.parent) if bundle.parent.name == "certifi" else ""
+            meta = read_plist(app / "Contents" / "Info.plist")
+            results.append(ctx.bundle_result(
+                "apps", app_label(app),
+                bundle, version=version or meta.get("CFBundleShortVersionString", ""),
+                note=f"{inner}" + (f" (certifi {version})" if version else ""),
+                group="app-bundle"))
+    if not results:
+        return [Result("apps", "App-bundled CA files", installed=False)]
+    return results
+
+
+def python_interpreters() -> list[Path]:
+    """Python 3 interpreters other than the one running the checker."""
+    candidates: list[Path] = []
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if folder:
+            candidates += sorted(Path(folder).glob("python3*"))
+    for pattern in ("/opt/homebrew/opt/python@*/bin/python3.*",
+                    "/usr/local/opt/python@*/bin/python3.*",
+                    "/Library/Frameworks/Python.framework/Versions/*/bin/python3",
+                    str(Path.home() / ".pyenv" / "versions" / "*" / "bin" / "python3")):
+        candidates += sorted(Path("/").glob(pattern.lstrip("/")))
+    # /usr/bin/python3 is a shim that offers to install the developer tools
+    # when they are missing; only use it when they are present.
+    if Path("/usr/bin/python3").exists() and sh(["xcode-select", "-p"], timeout=5).rc == 0:
+        candidates.append(Path("/usr/bin/python3"))
+
+    own = Path(sys.executable).resolve()
+    seen: set[Path] = {own}
+    found: list[Path] = []
+    for path in candidates:
+        if not re.fullmatch(r"python3(\.\d+)?", path.name) or not os.access(path, os.X_OK):
+            continue
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        found.append(path)
+    return found
+
+
+PY_INFO = ("import ssl, sys\n"
+           "try:\n    import certifi; c = certifi.where()\nexcept Exception:\n    c = ''\n"
+           "print(sys.version.split()[0]); print(ssl.OPENSSL_VERSION)\n"
+           "print(ssl.get_default_verify_paths().cafile or ''); print(c)\n")
+
+
+def t_pythons(ctx: Ctx) -> list[Result]:
+    results: list[Result] = []
+    for python in python_interpreters():
+        progress.detail(str(python))
+        r = sh([str(python), "-I", "-c", PY_INFO], timeout=20)
+        lines = r.out.splitlines()
+        if r.rc != 0 or len(lines) < 4:
+            continue
+        version, openssl, cafile, certifi_pem = lines[:4]
+        label = f"Python {version} ({python})"
+        lib = openssl.split()[0] + " " + (openssl.split()[1] if len(openssl.split()) > 1 else "")
+        if ctx.mode == "local" and ctx.servers:
+            accepted, total, detail, errors = ctx.run_probe(
+                lambda chain, timeout: p_interpreter(str(python), chain, timeout), str(python))
+            results.append(Result("pythons", label, version=f"{version} / {lib.strip()}",
+                                  store=cafile, method="live handshake, local lab",
+                                  accepted=accepted, total=total, errors=errors,
+                                  note=detail, group="runtime"))
+        elif cafile and Path(cafile).is_file():
+            results.append(ctx.bundle_result("pythons", label, Path(cafile),
+                                             version=version, group="runtime"))
+        if certifi_pem and Path(certifi_pem).is_file():
+            if Path(certifi_pem).resolve() in ctx.covered:
+                continue
+            results.append(ctx.bundle_result(
+                "pythons", f"certifi for {python}", Path(certifi_pem),
+                version=certifi_version(Path(certifi_pem).parent), group="ca-store"))
+    if not results:
+        return [Result("pythons", "Other Python interpreters", installed=False)]
+    return results
+
+
+def certifi_copies(roots: list[Path]) -> list[Path]:
+    """certifi bundles in venvs and user site-packages, found with Spotlight."""
+    if not shutil.which("mdfind"):
+        return []
+    found: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        progress.detail(f"Spotlight search for certifi under {root}")
+        r = sh(["mdfind", "-onlyin", str(root), 'kMDItemFSName == "cacert.pem"'], timeout=60)
+        for line in r.out.splitlines():
+            path = Path(line.strip())
+            if path.parent.name != "certifi" or ".app/" in line:
+                continue
+            if "emudhra-check" in path.parts:  # patch_sublime.py's backup
+                continue
+            found.append(path)
+    return sorted(set(found))
+
+
+def env_label(bundle: Path) -> str:
+    """`ComfyUI/venv` for .../ComfyUI/venv/lib/python3.13/site-packages/certifi/cacert.pem,
+    `ComfyUI/venv (pip)` for pip's vendored copy."""
+    parts = bundle.parts
+    if "lib" in parts:
+        i = len(parts) - 1 - parts[::-1].index("lib")
+        env = Path(*parts[:i])
+        label = f"{env.parent.name}/{env.name}"
+    else:
+        label = bundle.parent.parent.name
+    if "_vendor" in parts:
+        label += " (pip)"
+    return label
+
+
+def t_venvs(ctx: Ctx) -> list[Result]:
+    results: list[Result] = []
+    for bundle in certifi_copies(ctx.scan_roots):
+        if bundle.resolve() in ctx.covered:
+            continue
+        results.append(ctx.bundle_result(
+            "venvs", f"certifi in {env_label(bundle)}", bundle,
+            version=certifi_version(bundle.parent), group="ca-store"))
+    if not results:
+        note = "" if shutil.which("mdfind") else "needs Spotlight (mdfind)"
+        return [Result("venvs", "certifi in venvs", installed=False, note=note)]
+    return results
+
+
 def t_os_package(ctx: Ctx, key: str, name: str, distro: str) -> Result:
     if sys.platform != "linux":
         return Result(key, name, installed=False, note="not a Linux system")
@@ -1170,8 +1427,9 @@ TECHS = [
     ("macos", t_macos), ("homebrew", t_homebrew), ("openssl", t_openssl),
     ("curl", t_curl), ("python", t_python_ssl), ("certifi", t_certifi),
     ("pip", t_pip), ("uv", t_uv), ("node", t_node), ("npm", t_npm),
-    ("bun", t_bun), ("go", t_go), ("java", t_java), ("ruby", t_ruby),
+    ("bun", t_bun), ("deno", t_deno), ("go", t_go), ("java", t_java), ("ruby", t_ruby),
     ("nss", t_nss), ("electron", t_electron), ("sublime", t_sublime),
+    ("pythons", t_pythons), ("apps", t_app_bundles), ("venvs", t_venvs),
     ("rust", t_rust),
     ("composer", t_composer), ("elixir", t_elixir), ("perl", t_perl),
     ("cfssl", t_cfssl),
@@ -1204,6 +1462,10 @@ FIXED_LOOKUP = {
     "nss": "NSS",
     "electron": "Electron",
     "sublime": None,
+    "deno": None,
+    "pythons": None,
+    "apps": None,
+    "venvs": None,
     "rust": "Rust rustls-webpki",
     "composer": "Composer ca-bundle",
     "elixir": "Elixir castore",
@@ -1223,12 +1485,6 @@ FIXED_LOOKUP = {
 # ---------------------------------------------------------------------------
 # reporting
 # ---------------------------------------------------------------------------
-
-
-def shorten(text: str, width: int) -> str:
-    if len(text) <= width:
-        return text
-    return text[: width - 3] + "..."
 
 
 def method_short(method: str) -> str:
@@ -1258,16 +1514,19 @@ def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
     installed = [r for r in results if r.installed]
     installed.sort(key=lambda r: (r.verdict != "TRUSTS", r.group, r.name))
 
-    head = (f"{'TECH':<34} {'VERSION':<20} {'STORE':<32} "
-            f"{'TEST':<10} {'RESULT':<15}")
+    # STORE is last and never cut, so long paths do not shift the other columns.
+    rows = [(r.name, r.version or "-", method_short(r.method), accepted_text(r), r.store or "-")
+            for r in installed]
+    titles = ("TECH", "VERSION", "TEST", "RESULT", "STORE")
+    widths = [max([len(t)] + [len(row[i]) for row in rows]) for i, t in enumerate(titles[:4])]
+
+    def line(cells) -> str:
+        return " ".join(f"{c:<{w}}" for c, w in zip(cells, widths)) + " " + cells[4]
+
+    head = line(titles)
     out.append(head)
     out.append("-" * len(head))
-    for r in installed:
-        out.append(
-            f"{shorten(r.name, 34):<34} {shorten(r.version or '-', 20):<20} "
-            f"{shorten(r.store or '-', 32):<32} {method_short(r.method):<10} "
-            f"{accepted_text(r):<15}"
-        )
+    out.extend(line(row).rstrip() for row in rows)
 
     naive = [r for r in installed if r.verdict == "TRUSTS"]
     patched = [r for r in installed if r.verdict == "PATCHED"]
@@ -1279,7 +1538,7 @@ def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
         for r in naive:
             out.append(f"  - {r.name} {r.version}: accepts {r.accepted}/{r.total} chains")
             if r.note:
-                out.append(f"    {shorten(r.note, 74)}")
+                out.append(f"    {r.note}")
     else:
         out.append("No installed client accepted a compromised chain.")
 
@@ -1292,7 +1551,7 @@ def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
         out.append("Unresolved: " + ", ".join(f"{r.name} {r.version}".strip() for r in unknown))
         for r in unknown:
             if r.errors and r.note:
-                out.append(f"  - {r.name}: {r.errors}/{r.total} probes errored: {shorten(r.note, 60)}")
+                out.append(f"  - {r.name}: {r.errors}/{r.total} probes errored: {r.note}")
 
     missing = [r for r in results if not r.installed]
     if missing:
@@ -1378,6 +1637,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="only test the first N chains (debugging)")
     parser.add_argument("--deep", action="store_true",
                         help="also scan each Electron binary for the embedded roots (slow)")
+    parser.add_argument("--scan", action="append", default=[], metavar="DIR",
+                        help="also look for certifi copies (venvs) under DIR; repeatable. "
+                        "Home is always scanned")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="do not draw the progress line on stderr")
     parser.add_argument("--only", default="",
                         help="comma-separated tech keys, e.g. java or java,curl")
     args = parser.parse_args(argv)
@@ -1397,21 +1661,24 @@ def main(argv: list[str] | None = None) -> int:
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda *_: sys.exit(130))
 
+    selected = [(key, tech) for key, tech in TECHS if not wanted or key in wanted]
     results: list[Result] = []
+    progress.start(enabled=False if args.no_progress else None)
     try:
         if ctx.mode == "offline" and CACHE.is_dir():
             sweep_stale(CACHE)
         if ctx.mode == "local":
+            progress.step(0, len(selected), "lab")
             try:
                 ctx.start_lab()
             except LabError as exc:
+                progress.done()
                 print(f"error: {exc}", file=sys.stderr)
                 print("hint: pass --keys PATH (zip or directory with the eight .pem/.key pairs), "
                       "or use --mode offline", file=sys.stderr)
                 return 2
-        for key, tech in TECHS:
-            if wanted and key not in wanted:
-                continue
+        for index, (key, tech) in enumerate(selected, 1):
+            progress.step(index, len(selected), key)
             try:
                 produced = tech(ctx)
             except Exception as exc:  # noqa: BLE001 - one broken probe must not kill the run
@@ -1425,6 +1692,7 @@ def main(argv: list[str] | None = None) -> int:
                     result.fixed = ctx.patched[table]
                 results.append(result.finalize())
     finally:
+        progress.done()
         ctx.stop_lab()
 
     elapsed = time.time() - started

@@ -36,6 +36,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 
+from apps import app_bundles  # noqa: E402
 from lab import LabError, resolve_chains  # noqa: E402
 
 CERTIFI_REL = Path("Contents") / "MacOS" / "Lib" / "python3" / "certifi"
@@ -59,16 +60,23 @@ def fail(message: str) -> NoReturn:
 def find_apps(explicit: list[str]) -> list[Path]:
     if explicit:
         return [Path(p).expanduser().resolve() for p in explicit]
-    found: list[Path] = []
-    for base in (Path("/Applications"), Path.home() / "Applications"):
-        if base.is_dir():
-            found.extend(sorted(base.glob("Sublime Text*.app")))
-    return found
+    return list(app_bundles(pattern="Sublime Text*.app"))
 
 
 def backup_path(app: Path, root: Path) -> Path:
     """Keep the original bundle outside the app: code inside Contents/MacOS
-    must be signed, and an unsigned backup directory would break signing."""
+    must be signed, and an unsigned backup directory would break signing.
+
+    Top-level apps keep the old `<stem>/certifi` path so existing backups are
+    still found; apps in subfolders get the folder names in front.
+    """
+    for base in (Path("/Applications"), Path.home() / "Applications"):
+        try:
+            rel = app.relative_to(base)
+        except ValueError:
+            continue
+        if len(rel.parts) > 1:
+            return root / "__".join(rel.with_suffix("").parts) / "certifi"
     return root / app.stem / "certifi"
 
 

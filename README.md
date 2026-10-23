@@ -18,6 +18,46 @@ Background: [disclosure site](https://emudhra.we-have-a-problem.com/) ·
    who accepts.
 
 
+## Targets
+
+`--only` takes the keys in the first column. TEST is how the row is decided in
+the default `local` mode; `--mode offline` turns every handshake into a bundle
+check where the client has a readable bundle.
+
+| key | target | where it looks | TEST |
+|---|---|---|---|
+| `macos` | macOS Security.framework | System keychain, SSL policy | keychain: `security verify-cert` on each chain's intermediates (12) |
+| `homebrew` | Homebrew `ca-certificates` | `$(brew --prefix)/etc/ca-certificates/cert.pem` | bundle |
+| `openssl` | OpenSSL on `PATH` | its `OPENSSLDIR/cert.pem` | handshake (`s_client`) |
+| `curl` | curl on `PATH` | CA file from `curl -v` | handshake |
+| `python` | Python `ssl`, default context | the interpreter running the checker | handshake |
+| `certifi` | Python certifi | importable by that interpreter | handshake |
+| `pip` | pip's vendored certifi | `pip._vendor.certifi` | bundle |
+| `uv` | uv | compiled-in webpki-roots | version |
+| `node` | Node.js | `tls.rootCertificates` | handshake (`https.get`) |
+| `npm` | npm | Node's store | same result as `node` |
+| `bun` | Bun | compiled-in roots | handshake (`fetch`) |
+| `deno` | Deno | compiled-in Mozilla roots, or the keychain with `DENO_TLS_CA_STORE=system` | handshake (`fetch`) |
+| `go` | Go | `crypto/x509` system pool | handshake (compiled `net/http` client) |
+| `java` | every JVM | `java_home` default, `/Library/Java/JavaVirtualMachines`, `~/Library/Java/JavaVirtualMachines` (JetBrains `jbr-*` included) | handshake per JVM |
+| `ruby` | Ruby | `OpenSSL::X509::DEFAULT_CERT_FILE` | handshake (`Net::HTTP`) |
+| `nss` | Homebrew NSS | built-in roots | version |
+| `electron` | Electron apps | app bundles in `/Applications` and `~/Applications`, up to 3 folders deep | version per app; `--deep` adds root markers |
+| `sublime` | Sublime Text plugin host | `Sublime Text*.app` in `/Applications` and `~/Applications`, up to 3 folders deep; bundled certifi | bundle |
+| `pythons` | other Python 3 interpreters | `python3*` on `PATH`, Homebrew `python@*`, python.org framework, pyenv, `/usr/bin/python3` | handshake per interpreter; bundle for its certifi |
+| `apps` | CA files inside app bundles | `cacert.pem`, `ca-bundle.crt`, `ca-certificates.crt`, `curl-ca-bundle.crt` in any app found above | bundle per file |
+| `venvs` | certifi copies in venvs and user site-packages | Spotlight search under home and every `--scan DIR` | bundle per copy |
+| `rust` | Rust rustls-webpki / webpki-roots | `rustc` present; crates not inspected | version |
+| `composer` | Composer ca-bundle | `composer` on `PATH` | version of `composer`, not of its bundle |
+| `elixir` | Elixir castore | `elixir` on `PATH` | version of `elixir`, not of castore |
+| `perl` | Perl Mozilla::CA | module importable | version |
+| `cfssl` | Cloudflare CFSSL trust store | `cfssl` on `PATH` | detected only |
+| `ubuntu` `debian` `arch` `gentoo` `fedora` `freebsd` `chainguard` `alpine` | distribution `ca-certificates` | `/etc/os-release` | `-` on macOS |
+
+Browsers (Safari, Chrome, Chromium, Firefox, LibreWolf, Tor Browser, Edge,
+Brave, Opera, Vivaldi) are listed with their versions but not tested.
+
+
 ## Run
 
 ```sh
@@ -25,11 +65,11 @@ python3 checking/check_trust.py
 ```
 
 ```
-TECH                     VERSION   STORE                        TEST       RESULT
-Java <ver> (<vendor>)    ...       JDK cacerts                  handshake  rejects 0/12
-curl                     ...       /etc/ssl/cert.pem            handshake  rejects 0/12
-NSS                      ...       libnssckbi (built-in roots)  version    patched
-Electron                 N apps    Chromium + CRLSets           version    outdated
+TECH                     VERSION   TEST      RESULT       STORE
+Java <ver> (<vendor>)    ...       handshake rejects 0/12 /Library/Java/JavaVirtualMachines/<jdk>/Contents/Home/lib/security/cacerts
+curl                     ...       handshake rejects 0/12 /etc/ssl/cert.pem
+NSS                      ...       version   patched      libnssckbi (built-in roots)
+Electron                 N apps    version   outdated     Chromium root store + CRLSets
 ```
 
 
