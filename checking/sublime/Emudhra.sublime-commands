@@ -1,0 +1,6 @@
+[
+  {
+    "caption": "eMudhra: check local trust",
+    "command": "emudhra_trust_check"
+  }
+]

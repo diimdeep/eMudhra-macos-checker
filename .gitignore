@@ -1,0 +1,18 @@
+.DS_Store
+**/.DS_Store
+
+__pycache__/
+*.pyc
+
+# generated at runtime
+checking/.cache/
+checking/report.json
+
+# research material and key material, not part of the tool
+breadcrums/*
+!breadcrums/emudrahahahahaha-main.zip
+disclosure/*.zip
+
+# third-party snapshot and proof bundle, not needed by the tool
+disclosure/proof/
+disclosure/*.html
