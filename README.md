@@ -45,8 +45,9 @@ Electron                 N apps    Chromium + CRLSets           version    outda
 
 ```
 checking/              checker, lab, Sublime plugin and patcher
-disclosure/chains/     twelve captured chains (PEM)
-breadcrums/            eight recovered CA keys (zip)
+disclosure/            twelve captured chains (emudhra-test-host-chains.zip)
+keys/                  eight recovered CA keys and certificates (zip)
+KEYS.md                how keys, certificates, chains and test hosts relate
 ```
 
 ## Requirements
@@ -66,3 +67,6 @@ for the patcher.
 
 Included so the lab runs out of the box. They are derivable from the public
 certificates in milliseconds, so this adds no exposure.
+
+`keys/emudhra-intermediate-ca-keys.zip` repackages the public
+`emudrahahahahaha` repository (commit `c43b3f0`)

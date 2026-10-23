@@ -24,7 +24,7 @@ ROOT = HERE.parent
 CACHE = HERE / ".cache"
 sys.path.insert(0, str(HERE))
 
-from lab import Lab  # noqa: E402
+from lab import Lab, LabError, resolve_chains  # noqa: E402
 
 PLUGIN = HERE / "sublime" / "local_trust_check.py"
 COMMANDS = HERE / "sublime" / "Emudhra.sublime-commands"
@@ -47,39 +47,41 @@ def install_plugin(lab_file: Path) -> Path:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Serve the twelve chains for the Sublime plugin.")
-    parser.add_argument("--chains", default=str(ROOT / "disclosure" / "chains"))
+    parser.add_argument("--chains", help="directory or zip with the twelve chains")
     parser.add_argument("--json-out", default=str(CACHE / "lab.json"))
     parser.add_argument("--keys", help="zip or directory with the recovered CA keys")
     parser.add_argument("--install-plugin", action="store_true",
                         help="copy the plugin and settings into Packages/User")
     args = parser.parse_args(argv)
 
-    chains_dir = Path(args.chains).expanduser().resolve()
-    if not list(chains_dir.glob("*.pem")):
-        print(f"error: no chains in {chains_dir}", file=sys.stderr)
+    try:
+        chains_dir = resolve_chains(ROOT, CACHE, args.chains)
+    except LabError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
 
     lab = Lab(ROOT, CACHE, "openssl", keys=args.keys)
-    lab.prepare(chains_dir)
-    lab.start()
-
     lab_file = Path(args.json_out).expanduser().resolve()
-    lab_file.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "chains": [{"name": chain.name, "port": chain.port} for chain in lab.chains],
-    }
-    lab_file.write_text(json.dumps(payload, indent=2) + "\n")
-
-    print(f"{len(lab.chains)} chains on 127.0.0.1, lab file: {lab_file}")
-    if args.install_plugin:
-        user = install_plugin(lab_file)
-        print(f"plugin installed in {user}")
-        print('run "eMudhra: check local trust" from the command palette')
-    print("Ctrl-C to stop")
-
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(0))
     try:
+        lab.prepare(chains_dir)
+        lab.start()
+
+        lab_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "chains": [{"name": chain.name, "port": chain.port} for chain in lab.chains],
+        }
+        lab_file.write_text(json.dumps(payload, indent=2) + "\n")
+
+        print(f"{len(lab.chains)} chains on 127.0.0.1 and ::1, lab file: {lab_file}")
+        if args.install_plugin:
+            user = install_plugin(lab_file)
+            print(f"plugin installed in {user}")
+            print('run "eMudhra: check local trust" from the command palette')
+        print("Ctrl-C to stop")
+
         while True:
             time.sleep(0.5)
     except KeyboardInterrupt:

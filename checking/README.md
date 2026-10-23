@@ -1,6 +1,6 @@
 # checking/
 
-Doesthis Mac still trust the compromised eMudhra intermediate CAs?
+Does this Mac still trust the compromised eMudhra intermediate CAs?
 
 `local` mode completes real TLS handshakes against a loopback lab; `offline`
 inspects CA bundles with `openssl verify`.
@@ -26,7 +26,7 @@ python3 checking/check_trust.py --json          # write checking/report.json
 | `--mode offline` | `openssl verify` against each client's CA bundle |
 | `--only a,b` | run only these technologies (`java`, `curl`, `electron`, …) |
 | `--keys PATH` | alternate key archive; default is the shipped zip |
-| `--chains DIR` | alternate chain directory |
+| `--chains PATH` | alternate chain directory or zip |
 | `--json [PATH]` | write results as JSON (default `checking/report.json`) |
 | `--deep` | scan each Electron binary for the embedded roots |
 | `--top N` | test only the first N chains (debugging) |
@@ -37,15 +37,23 @@ python3 checking/check_trust.py --json          # write checking/report.json
 
 The lab needs two inputs:
 
-* `disclosure/chains/` — twelve chains as served by the test hosts, published
+* `disclosure/emudhra-test-host-chains.zip` — twelve chains as served by the
+  test hosts (the disclosure's `chains.zip`), published
   with the [disclosure site](https://emudhra.we-have-a-problem.com/)
   ([source](https://github.com/galadran/we-have-a-problem.com)): 3 kinds
   (`dv`, `ov`, `ev`) × 2 generations × 2 trust paths.
-* `breadcrums/emudrahahahahaha-main.zip` — the eight compromised keys.
+* `keys/emudhra-intermediate-ca-keys.zip` — the eight compromised keys and
+  their certificates.
+
+An unzipped `disclosure/chains/*.pem` takes precedence over the chains zip;
+the zip is extracted once into `checking/.cache/chains-<hash>/`.
 
 For each chain `lab.py` keeps `chain[1:]`, mints a `localhost` leaf under the
 matching key, and serves `leaf → intermediate [→ cross-sign]` on `127.0.0.1`.
-Leaves last 30 days; extracted keys are deleted with the run.
+Leaves last 30 days; extracted keys are deleted with the run. Each chain is
+served on both `127.0.0.1` and `::1`, since clients resolve `localhost` to
+either. A run killed before cleanup leaves a `lab-*` directory; the next run
+removes it.
 
 Both trust paths matter: emSign anchors at `emSign ECC Root CA - G3`, AAA at
 `AAA Certificate Services`. certifi has the first and not the second; old Java
@@ -66,7 +74,7 @@ Java <ver> (<vendor>)    ...       JDK cacerts                  handshake  rejec
 curl                     ...       /etc/ssl/cert.pem            handshake  rejects 0/12
 NSS                      ...       libnssckbi (built-in roots)  version    patched
 Electron                 N apps    Chromium + CRLSets           version    outdated
-macOS Security.framework ...       System keychain              keychain    rejects 0/2 CAs
+macOS Security.framework ...       System keychain              keychain    rejects 0/12
 ```
 
 `TEST` is how the row was decided: `handshake` (strongest), `bundle`,
@@ -74,7 +82,13 @@ macOS Security.framework ...       System keychain              keychain    reje
 `-` (not testable).
 
 `RESULT` is `TRUSTS n/12` (bad), `rejects 0/12`, `patched` / `outdated`
-(version only), `unknown`, or `-`.
+(version only), `unknown`, or `-`. A probe that times out, cannot connect, or
+crashes counts as an error, never as a rejection; a row with errors and no
+acceptances reads `unknown, n/12 err` and is listed under "Unresolved".
+
+Version rows compare against the fix for the installed release line: Go
+1.27.0 needs 1.27.3 even though 1.26.10 is also listed, and a line with no
+fix (Composer 1.5, Electron 38) is outdated.
 
 Electron gets a per-app list below the table (and `results[].items` in JSON);
 `--deep` adds root counts. Fixed releases are per major line: 42.11.16, 43.8.1,
@@ -97,7 +111,8 @@ python3 checking/serve_lab.py --install-plugin
 # restart Sublime, then: "eMudhra: check local trust"
 ```
 
-Two columns: default `ssl` context, then bundled `certifi`. Ctrl-C stops the lab.
+Two columns: default `ssl` context, then bundled `certifi`. Ctrl-C stops the lab. The plugin's
+verdict counts a chain as trusted if either column accepts it.
 
 To patch:
 
@@ -111,11 +126,16 @@ It swaps `Contents/MacOS/Lib/python3/certifi` for a clean bundle and re-signs
 ad-hoc; the backup lives in `~/Library/Application Support/emudhra-check/`.
 Quit Sublime first. Updates undo the patch, and the new signature resets
 Gatekeeper and TCC expectations.
+`--restore` puts the original files back but keeps the ad-hoc signature;
+reinstall Sublime to get the vendor's signature back. `--source` accepts a
+certifi package directory or a bare PEM bundle (which replaces only
+`cacert.pem`).
 
 ## Caveats
 
-* **macOS**: CT rejects every minted leaf, so the row tests the intermediate
-  under the SSL policy instead.
+* **macOS**: CT rejects every minted leaf, so the row tests each chain's
+  intermediate (and cross-sign) under the SSL policy instead.
+* **Java**: the probe is compiled with `--release 8` so Java 8 homes can run it.
 * **Go**: refuses these certificates as `not standards compliant` before trust
   is consulted.
 * **NSS, uv, Electron**: version-only; their stores are compiled in or per-app.
@@ -130,11 +150,14 @@ Gatekeeper and TCC expectations.
 * `sublime/local_trust_check.py` — the plugin.
 * `patch_sublime.py` — swaps Sublime's certifi, re-signs ad-hoc.
 * `patched_versions.json` — fixed releases from the disclosure.
+* `test_check_trust.py` — unit tests: `python3 -m unittest checking/test_check_trust.py`.
 * `report.json` — last JSON result, written on `--json`.
 
 ## Adding a client
 
 Add `t_<name>(ctx) -> Result`, register it in `TECHS` as `("<key>", t_<name>)`.
 Use `ctx.local()["<probe>"]` for a handshake, `ctx.bundle_counts(path)` for a
-bundle, or neither for version-only. Return a list for technologies with several
+bundle, or neither for version-only. Probes return `(True | False | None,
+detail)`; pass the client's failure text through `classify()` so only real
+certificate rejections count as `False`. Return a list for technologies with several
 installations. `FIXED_LOOKUP` maps the row to its fixed version.

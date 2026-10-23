@@ -39,16 +39,21 @@ def certifi_module():
         return None
 
 
-def probe(port: int, cafile: str | None = None) -> tuple[bool, str]:
-    """One TLS handshake against a loopback chain."""
+def probe(port: int, cafile: str | None = None) -> tuple[bool | None, str]:
+    """One TLS handshake against a loopback chain.
+
+    True: accepted.  False: certificate rejected.  None: could not test.
+    """
     try:
         context = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
         with socket.create_connection(("127.0.0.1", int(port)), timeout=TIMEOUT) as sock:
             with context.wrap_socket(sock, server_hostname="localhost") as tls:
                 tls.getpeercert()
         return True, ""
-    except Exception as exc:  # noqa: BLE001 - the client's own error is the result
+    except ssl.SSLCertVerificationError as exc:
         return False, f"{type(exc).__name__}: {exc}"
+    except Exception as exc:  # noqa: BLE001 - anything else means no answer
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def run_checks(lab_file: str) -> dict:
@@ -83,8 +88,15 @@ def run_checks(lab_file: str) -> dict:
     }
 
 
+def label(state: bool | None, accepted: str) -> str:
+    return {True: accepted, False: "rejected", None: "error"}[state]
+
+
 def report_text(result: dict) -> str:
-    accepted = sum(1 for row in result["rows"] if row["certifi"])
+    accepted = sum(1 for row in result["rows"] if row["default"] or row["certifi"])
+    errors = sum(1 for row in result["rows"]
+                 if not (row["default"] or row["certifi"])
+                 and None in (row["default"], row["certifi"]))
     total = len(result["rows"])
     lines = [
         "eMudhra local trust check - Sublime Text plugin host",
@@ -99,17 +111,22 @@ def report_text(result: dict) -> str:
         "-" * 58,
     ]
     for row in result["rows"]:
-        default = "accepted" if row["default"] else "rejected"
-        certifi = "ACCEPTED" if row["certifi"] else "rejected"
+        default = label(row["default"], "ACCEPTED")
+        certifi = label(row["certifi"], "ACCEPTED")
         lines.append(f"{row['name']:<34}{default:<12}{certifi:<10}")
+        if row["default"] is None and row["default_error"]:
+            lines.append(f"  default: {row['default_error']}")
         if row["certifi_error"]:
             lines.append(f"  certifi: {row['certifi_error']}")
     lines.append("")
     if accepted:
-        lines.append(f"RESULT: certifi accepts {accepted}/{total} chains - the plugin host still trusts the CAs.")
+        lines.append(f"RESULT: {accepted}/{total} chains accepted (default or certifi): "
+                     "the plugin host still trusts the CAs.")
         lines.append("Patch the bundled certifi and re-sign the app, then run this again.")
+    elif errors:
+        lines.append(f"RESULT: {errors}/{total} chains could not be tested; is serve_lab.py running?")
     else:
-        lines.append(f"RESULT: certifi rejects {total}/{total} chains - the plugin host is clean.")
+        lines.append(f"RESULT: both contexts reject {total}/{total} chains: the plugin host is clean.")
     return "\n".join(lines)
 
 
@@ -155,7 +172,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     result = run_checks(args.lab)
     print(json.dumps(result, indent=2) if args.json else report_text(result))
-    return 0 if not any(row["certifi"] for row in result["rows"]) else 1
+    rows = result["rows"]
+    if any(row["default"] or row["certifi"] for row in rows):
+        return 1
+    if any(None in (row["default"], row["certifi"]) for row in rows):
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

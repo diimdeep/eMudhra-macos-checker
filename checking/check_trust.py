@@ -17,10 +17,11 @@ Examples
 --------
     python3 checking/check_trust.py                 # local lab, full report
     python3 checking/check_trust.py --mode offline  # no servers, bundles only
-    python3 checking/check_trust.py --json out.json --quick
+    python3 checking/check_trust.py --json out.json --only java,curl
 
 Exit status is 1 when at least one installed client accepts a chain, so this
-can be used as a CI-style canary.
+can be used as a CI-style canary.  A probe that errors out (timeout, refused
+connection, client crash) is reported as unknown, never as a rejection.
 """
 
 from __future__ import annotations
@@ -32,10 +33,12 @@ import platform
 import plistlib
 import re
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -47,7 +50,7 @@ ROOT = HERE.parent
 CACHE = HERE / ".cache"
 sys.path.insert(0, str(HERE))
 
-from lab import Lab, LabError, split_pem  # noqa: E402
+from lab import Lab, LabError, resolve_chains, split_pem, sweep_stale  # noqa: E402
 
 VERSION = "1.0"
 
@@ -94,21 +97,47 @@ def vnum(text: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", text)[:8])
 
 
+def fixed_candidates(fixed: str) -> list[tuple[int, ...]]:
+    return sorted({vnum(c) for c in fixed.split(",")
+                   if c.strip().lower() != "pending" and vnum(c)})
+
+
+def line_width(candidates: list[tuple[int, ...]]) -> int:
+    """How many leading components name a release line.
+
+    Electron's fixes (42.11.16, 43.8.1, 44.9.1) differ in the major, so a
+    line is one component; Go's (1.26.10, 1.27.3) need two.
+    """
+    for width in range(1, max((len(c) for c in candidates), default=1) + 1):
+        if len({c[:width] for c in candidates}) == len(candidates):
+            return width
+    return 1
+
+
+def version_patched(installed: str, candidates: list[tuple[int, ...]]) -> bool | None:
+    """True if `installed` is at or past the fix for its own release line.
+
+    Anything newer than every fix is patched; a line with no fix listed
+    (Composer 1.5 between 1.4.16 and 1.6.0, Electron 38) is not.
+    """
+    value = vnum(installed)
+    if not value or not candidates:
+        return None
+    if value > max(candidates):
+        return True
+    width = line_width(candidates)
+    same_line = [c for c in candidates if c[:width] == value[:width]]
+    return bool(same_line) and value >= max(same_line)
+
+
 def vs_fixed(installed: str, fixed: str) -> str | None:
     """Compare an installed version with the disclosure's fixed version(s)."""
-    if not installed or not fixed or fixed.strip().lower() == "pending":
+    if not installed or not fixed:
         return None
-    vi = vnum(installed)
-    if not vi:
+    state = version_patched(installed, fixed_candidates(fixed))
+    if state is None:
         return None
-    for candidate in fixed.split(","):
-        c = candidate.strip()
-        if not c or c.lower() == "pending":
-            continue
-        vc = vnum(c)
-        if vc and vi >= vc:
-            return "patched"
-    return "outdated"
+    return "patched" if state else "outdated"
 
 
 def load_patched(html_path: Path | None) -> tuple[list[tuple[str, str]], dict[str, str]]:
@@ -149,13 +178,19 @@ class Result:
     verdict: str = ""
     note: str = ""
     group: str = "runtime"
+    errors: int = 0
     items: list = field(default_factory=list)
 
     def finalize(self) -> "Result":
         if not self.installed:
             self.verdict = "N/A"
         elif self.accepted is not None and self.total:
-            self.verdict = "TRUSTS" if self.accepted else "REJECTS"
+            if self.accepted:
+                self.verdict = "TRUSTS"
+            elif self.errors:
+                self.verdict = "UNKNOWN"
+            else:
+                self.verdict = "REJECTS"
         elif self.verdict:
             pass
         else:
@@ -165,11 +200,12 @@ class Result:
 
 
 def accepted_text(r: Result) -> str:
-    unit = " CAs" if r.method.startswith("security") else ""
     if r.verdict == "TRUSTS" and r.accepted is not None:
-        return f"TRUSTS {r.accepted}/{r.total}{unit}"
+        return f"TRUSTS {r.accepted}/{r.total}"
     if r.verdict == "REJECTS":
-        return f"rejects 0/{r.total}{unit}"
+        return f"rejects 0/{r.total}"
+    if r.verdict == "UNKNOWN" and r.errors:
+        return f"unknown, {r.errors}/{r.total} err"
     if r.verdict == "PATCHED":
         return "patched"
     if r.verdict == "OUTDATED":
@@ -184,11 +220,30 @@ def accepted_text(r: Result) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Wording each client uses when it refuses the certificate.  A failure that
+# matches none of these (timeout, refused connection, crash) is an error, not
+# a rejection.
+REJECT_RE = re.compile(
+    r"certificate verify failed|SSLCertVerificationError|SSL certificate problem"
+    r"|verify error|Verification error|unable to get local issuer"
+    r"|PKIX path|ValidatorException|CertPathBuilderException|CertificateException"
+    r"|x509:|failed to verify certificate|not standards compliant"
+    r"|UNABLE_TO_|SELF_SIGNED|CERT_|DEPTH_ZERO|ERR_TLS_CERT",
+)
+
+
+def classify(ok: bool, detail: str) -> tuple[bool | None, str]:
+    """(True, _) accepted, (False, _) rejected the chain, (None, _) no answer."""
+    if ok:
+        return True, detail
+    return (False if REJECT_RE.search(detail or "") else None), detail
+
+
 def p_curl(chain, timeout):
     r = sh(["curl", "-sS", "-m", str(timeout), "-o", "/dev/null",
             "-w", "%{http_code}", chain.url], timeout=timeout + 4)
     detail = first_line(r.err) or f"exit {r.rc}"
-    return (r.rc == 0 and r.out.strip() == "200"), detail
+    return classify(r.rc == 0 and r.out.strip() == "200", detail)
 
 
 def p_openssl(chain, timeout):
@@ -201,29 +256,31 @@ def p_openssl(chain, timeout):
     for line in text.splitlines():
         if "verify error" in line or "Verification error" in line or "Verification: OK" in line:
             detail = line.strip()
-    return ok, detail or first_line(r.err)
+    return classify(ok, detail or first_line(r.err))
 
 
-def p_python(chain, timeout):
+def _python_probe(chain, timeout, cafile: str | None):
     try:
-        ctx = ssl.create_default_context()
+        ctx = ssl.create_default_context(cafile=cafile)
         with socket.create_connection(("127.0.0.1", chain.port), timeout=timeout) as sock:
             with ctx.wrap_socket(sock, server_hostname="localhost"):
                 return True, "connected"
-    except Exception as exc:  # noqa: BLE001 - report the client's own error
+    except ssl.SSLCertVerificationError as exc:
         return False, f"{type(exc).__name__}: {exc}"
+    except Exception as exc:  # noqa: BLE001 - report the client's own error
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def p_python(chain, timeout):
+    return _python_probe(chain, timeout, None)
 
 
 def p_certifi(chain, timeout):
     try:
         import certifi
-
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        with socket.create_connection(("127.0.0.1", chain.port), timeout=timeout) as sock:
-            with ctx.wrap_socket(sock, server_hostname="localhost"):
-                return True, "connected"
-    except Exception as exc:  # noqa: BLE001
-        return False, f"{type(exc).__name__}: {exc}"
+    except ImportError:
+        return None, "certifi not installed"
+    return _python_probe(chain, timeout, certifi.where())
 
 
 NODE_SCRIPT = """
@@ -249,23 +306,23 @@ try {
 def p_node(chain, timeout):
     r = sh(["node", "-e", NODE_SCRIPT, chain.url], timeout=timeout + 6)
     ok = r.rc == 0 and r.out.startswith("OK")
-    return ok, first_line(r.out) or first_line(r.err)
+    return classify(ok, first_line(r.out) or first_line(r.err))
 
 
 def p_bun(chain, timeout):
     r = sh(["bun", "-e", BUN_SCRIPT, chain.url], timeout=timeout + 6)
     ok = r.rc == 0 and r.out.startswith("OK")
-    return ok, first_line(r.out) or first_line(r.err)
+    return classify(ok, first_line(r.out) or first_line(r.err))
 
 
 def p_ruby(chain, timeout):
     script = (
         "require 'net/http'; require 'uri'; "
         f"begin; Net::HTTP.get_response(URI({chain.url!r})); puts 'OK'; "
-        "rescue => e; puts 'ERR ' + e.class.to_s; exit 1; end"
+        "rescue => e; puts 'ERR ' + e.class.to_s + ': ' + e.message; exit 1; end"
     )
     r = sh(["ruby", "-e", script], timeout=timeout + 6)
-    return r.out.startswith("OK"), first_line(r.out) or first_line(r.err)
+    return classify(r.out.startswith("OK"), first_line(r.out) or first_line(r.err))
 
 
 JAVA_SRC = """
@@ -335,7 +392,10 @@ class Helpers:
             self.dir.mkdir(parents=True, exist_ok=True)
             src = self.dir / "HttpsCheck.java"
             src.write_text(JAVA_SRC)
-            r = sh(["javac", "--release", "11", "-d", str(self.dir), str(src)], timeout=90)
+            # Java 8 homes are the likeliest to still carry the AAA root, so
+            # the class file has to load there too.
+            r = sh(["javac", "--release", "8", "-Xlint:-options", "-d", str(self.dir), str(src)],
+                   timeout=90)
             if r.rc != 0:
                 self.java_error = first_line(r.err)
                 return None
@@ -364,20 +424,24 @@ class Helpers:
             return self.go
 
 
-def probe_java(chain, timeout, helpers: Helpers):
-    cp = helpers.ensure_java()
-    if cp is None:
-        return None, helpers.java_error
-    r = sh(["java", "-cp", str(cp), "HttpsCheck", chain.url], timeout=timeout + 10)
-    return r.out.startswith("OK"), first_line(r.out) or first_line(r.err)
-
-
 def probe_go(chain, timeout, helpers: Helpers):
     binary = helpers.ensure_go()
     if binary is None:
         return None, helpers.go_error
     r = sh([str(binary), chain.url], timeout=timeout + 6)
-    return r.out.startswith("OK"), first_line(r.out) or first_line(r.err)
+    return classify(r.out.startswith("OK"), first_line(r.out) or first_line(r.err))
+
+
+# (accepted, total, detail, errors) for one client across all chains
+Summary = tuple[int, int, str, int]
+
+
+def summarize(values: list[tuple[bool | None, str]]) -> Summary:
+    good = sum(1 for ok, _ in values if ok)
+    errors = [d for ok, d in values if ok is None]
+    rejections = [d for ok, d in values if ok is False and d]
+    detail = (errors or rejections or [""])[0]
+    return good, len(values), detail, len(errors)
 
 
 # ---------------------------------------------------------------------------
@@ -392,14 +456,15 @@ class Ctx:
         self.timeout = args.timeout
         self.cache = CACHE
         self.helpers = Helpers(CACHE)
-        self.chains_dir = Path(args.chains).expanduser().resolve()
+        self.chains_dir = resolve_chains(ROOT, CACHE, args.chains)
         self.chain_files = sorted(self.chains_dir.glob("*.pem"))
         self.openssl = shutil.which("openssl") or "openssl"
         self.servers = []
         self.limited = bool(args.top)
-        self._local: dict[str, tuple[int, int, str]] | None = None
-        self._java: dict[str, tuple[int, int, str]] = {}
+        self._local: dict[str, Summary] | None = None
+        self._java: dict[str, Summary] = {}
         self._lock = threading.Lock()
+        self.memo: dict[str, Result] = {}
         disclosure = Path(args.disclosure).expanduser().resolve() if args.disclosure else None
         self.patched_rows, self.patched = load_patched(disclosure)
 
@@ -416,6 +481,8 @@ class Ctx:
     def stop_lab(self):
         if getattr(self, "lab", None):
             self.lab.cleanup()
+        for stale in self.cache.glob("keychain-*.pem"):  # left by older versions
+            stale.unlink(missing_ok=True)
 
     # -- bundle check ---------------------------------------------------
 
@@ -430,7 +497,7 @@ class Ctx:
 
     # -- local handshakes ----------------------------------------------
 
-    def local(self) -> dict[str, tuple[int, int, str]]:
+    def local(self) -> dict[str, Summary]:
         """Run every installed client against every local chain once."""
         if self._local is not None:
             return self._local
@@ -447,8 +514,7 @@ class Ctx:
             "bun": p_bun,
             "ruby": p_ruby,
         }
-        if self.helpers.ensure_java():
-            clients["java"] = lambda c, t: probe_java(c, t, self.helpers)
+        # Java is absent on purpose: t_java tests every JVM home separately.
         if self.helpers.ensure_go():
             clients["go"] = lambda c, t: probe_go(c, t, self.helpers)
 
@@ -467,15 +533,10 @@ class Ctx:
                     ok, detail = None, f"{type(exc).__name__}: {exc}"
                 results[name].append((ok, detail))
 
-        summary = {}
-        for name, values in results.items():
-            good = sum(1 for ok, _ in values if ok)
-            failures = [d for ok, d in values if not ok and d]
-            summary[name] = (good, len(values), failures[0] if failures else "")
-        self._local = summary
-        return summary
+        self._local = {name: summarize(values) for name, values in results.items()}
+        return self._local
 
-    def java_local(self, home: Path, classes: Path) -> tuple[int, int, str]:
+    def java_local(self, home: Path, classes: Path) -> Summary:
         """Handshake results for one specific JVM, cached per home."""
         key = str(home)
         with self._lock:
@@ -491,9 +552,7 @@ class Ctx:
                     values.append(fut.result())
                 except Exception as exc:  # noqa: BLE001
                     values.append((None, f"{type(exc).__name__}: {exc}"))
-        good = sum(1 for ok, _ in values if ok)
-        failures = [d for ok, d in values if not ok and d]
-        result = (good, len(values), failures[0] if failures else "")
+        result = summarize(values)
         with self._lock:
             self._java[key] = result
         return result
@@ -506,26 +565,24 @@ class Ctx:
         if not self.servers:
             return None, None, "needs the local lab (run without --mode offline)"
 
-        picks = [c for c in self.servers if c.name.startswith("dv-g3b")]
         ok = 0
         detail = ""
-        for chain in picks:
-            blocks = split_pem(chain.path.read_text())[1:]  # drop the minted leaf
-            cmd = ["security", "verify-cert", "-p", "ssl", "-l", "-L"]
-            temp = []
-            for i, block in enumerate(blocks):
-                path = self.cache / f"keychain-{chain.name}-{i}.pem"
-                path.write_text(block + "\n")
-                cmd += ["-c", str(path)]
-                temp.append(path)
-            r = sh(cmd, timeout=15)
-            text = r.out + r.err
-            if "certificate verification successful" in text:
-                ok += 1
-            for line in text.splitlines():
-                if "Cert Verify Result" in line or "CSSMERR" in line:
-                    detail = line.strip()
-        return ok, len(picks), detail
+        with tempfile.TemporaryDirectory(prefix="keychain-", dir=self.cache) as tmp:
+            for chain in self.servers:
+                blocks = split_pem(chain.path.read_text())[1:]  # drop the minted leaf
+                cmd = ["security", "verify-cert", "-p", "ssl", "-l", "-L"]
+                for i, block in enumerate(blocks):
+                    path = Path(tmp) / f"{chain.name}-{i}.pem"
+                    path.write_text(block + "\n")
+                    cmd += ["-c", str(path)]
+                r = sh(cmd, timeout=15)
+                text = r.out + r.err
+                if "certificate verification successful" in text:
+                    ok += 1
+                for line in text.splitlines():
+                    if "Cert Verify Result" in line or "CSSMERR" in line:
+                        detail = line.strip()
+        return ok, len(self.servers), detail
 
     # -- misc -----------------------------------------------------------
 
@@ -576,9 +633,9 @@ def t_openssl(ctx: Ctx) -> Result:
         store = str(Path(m.group(1)) / "cert.pem")
     local = ctx.local().get("openssl") if ctx.mode == "local" else None
     if local:
-        accepted, total, detail = local
+        accepted, total, detail, errors = local
         return Result("openssl", "OpenSSL", version=version, store=store,
-                      method="live handshake, local lab", accepted=accepted,
+                      method="live handshake, local lab", accepted=accepted, errors=errors,
                       total=total, note=detail, group="runtime")
     if store and Path(store).is_file():
         accepted, total = ctx.bundle_counts(Path(store))
@@ -588,18 +645,28 @@ def t_openssl(ctx: Ctx) -> Result:
     return Result("openssl", "OpenSSL", version=version, store=store, group="runtime")
 
 
-def t_curl(ctx: Ctx) -> Result:
-    version = first_line(sh(["curl", "--version"], timeout=10).out).split(" ")[1]
+def curl_cafile(ctx: Ctx) -> str:
+    """The CA file curl reports in its verbose output, or a guess offline."""
+    if ctx.servers:
+        r = sh(["curl", "-sv", "-m", "3", "-o", "/dev/null", ctx.servers[0].url], timeout=8)
+        m = re.search(r"CAfile:\s*(\S+)", r.err)
+        if m and m.group(1) != "none":
+            return m.group(1)
     candidates = ["/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt",
                   "/etc/ssl/certs/ca-certificates.crt"]
-    store = next((p for p in candidates if Path(p).is_file()), "")
+    return next((p for p in candidates if Path(p).is_file()), "")
+
+
+def t_curl(ctx: Ctx) -> Result:
+    version = first_line(sh(["curl", "--version"], timeout=10).out).split(" ")[1]
+    store = curl_cafile(ctx)
     local = ctx.local().get("curl") if ctx.mode == "local" else None
     if local:
-        accepted, total, detail = local
+        accepted, total, detail, errors = local
         return Result("curl", "curl", version=version, store=store,
-                      method="live handshake, local lab", accepted=accepted,
+                      method="live handshake, local lab", accepted=accepted, errors=errors,
                       total=total, note=detail, group="runtime")
-    if store:
+    if store and Path(store).is_file():
         accepted, total = ctx.bundle_counts(Path(store))
         return Result("curl", "curl", version=version, store=store,
                       method="openssl verify -CAfile", accepted=accepted,
@@ -613,10 +680,10 @@ def t_python_ssl(ctx: Ctx) -> Result:
     store = paths.cafile or ""
     local = ctx.local().get("python") if ctx.mode == "local" else None
     if local:
-        accepted, total, detail = local
+        accepted, total, detail, errors = local
         return Result("python", "Python ssl (default context)", version=version,
                       store=store, method="live handshake, local lab",
-                      accepted=accepted, total=total, note=detail, group="runtime")
+                      accepted=accepted, errors=errors, total=total, note=detail, group="runtime")
     if store:
         accepted, total = ctx.bundle_counts(Path(store))
         return Result("python", "Python ssl (default context)", version=version,
@@ -632,10 +699,10 @@ def t_certifi(ctx: Ctx) -> Result:
         return Result("certifi", "Python certifi", installed=False)
     local = ctx.local().get("certifi") if ctx.mode == "local" else None
     if local:
-        accepted, total, detail = local
+        accepted, total, detail, errors = local
         return Result("certifi", "Python certifi", version=certifi.__version__,
                       store=certifi.where(), method="live handshake, local lab",
-                      accepted=accepted, total=total, note=detail, group="ca-store")
+                      accepted=accepted, errors=errors, total=total, note=detail, group="ca-store")
     accepted, total = ctx.bundle_counts(Path(certifi.where()))
     return Result("certifi", "Python certifi", version=certifi.__version__,
                   store=certifi.where(), method="openssl verify -CAfile",
@@ -669,18 +736,25 @@ def t_uv(ctx: Ctx) -> Result:
 
 
 def t_node(ctx: Ctx) -> Result:
+    """Memoized: t_npm reports the same store."""
+    if "node" not in ctx.memo:
+        ctx.memo["node"] = _node_result(ctx)
+    return ctx.memo["node"]
+
+
+def _node_result(ctx: Ctx) -> Result:
     if not have("node"):
         return Result("node", "Node.js", installed=False)
     version = first_line(sh(["node", "-v"], timeout=10).out).lstrip("v")
     local = ctx.local().get("node") if ctx.mode == "local" else None
     if local:
-        accepted, total, detail = local
+        accepted, total, detail, errors = local
         store = ""
         r = sh(["node", "-p", "require('tls').rootCertificates.length"], timeout=10)
         if r.rc == 0:
             store = f"tls.rootCertificates ({first_line(r.out)} roots)"
         return Result("node", "Node.js", version=version, store=store,
-                      method="live handshake, local lab", accepted=accepted,
+                      method="live handshake, local lab", accepted=accepted, errors=errors,
                       total=total, note=detail, group="runtime")
     r = sh(["node", "-e",
             "process.stdout.write(require('tls').rootCertificates.join('\\n'))"], timeout=25)
@@ -702,7 +776,7 @@ def t_npm(ctx: Ctx) -> Result:
     node = t_node(ctx)
     return Result("npm", "npm", version=version, store="Node's root store",
                   method=node.method, accepted=node.accepted, total=node.total,
-                  note="uses the Node.js store", group="runtime")
+                  errors=node.errors, note="uses the Node.js store", group="runtime")
 
 
 def t_bun(ctx: Ctx) -> Result:
@@ -711,9 +785,9 @@ def t_bun(ctx: Ctx) -> Result:
     version = first_line(sh(["bun", "--version"], timeout=10).out)
     local = ctx.local().get("bun") if ctx.mode == "local" else None
     if local:
-        accepted, total, detail = local
+        accepted, total, detail, errors = local
         return Result("bun", "Bun", version=version, store="BoringSSL, compiled-in roots",
-                      method="live handshake, local lab", accepted=accepted,
+                      method="live handshake, local lab", accepted=accepted, errors=errors,
                       total=total, note=detail, group="runtime")
     return Result("bun", "Bun", version=version, store="BoringSSL, compiled-in roots",
                   method="version only", group="runtime")
@@ -727,10 +801,10 @@ def t_go(ctx: Ctx) -> Result:
     version = m.group(1) if m else ""
     local = ctx.local().get("go") if ctx.mode == "local" else None
     if local:
-        accepted, total, detail = local
+        accepted, total, detail, errors = local
         return Result("go", "Go", version=version,
                       store="crypto/x509 system pool", method="live handshake, local lab",
-                      accepted=accepted, total=total, note=detail, group="runtime")
+                      accepted=accepted, errors=errors, total=total, note=detail, group="runtime")
     return Result("go", "Go", version=version, store="crypto/x509 system pool",
                   method="version only", group="runtime",
                   note="Go 1.27 rejects these CA certificates outright: x509: not standards compliant")
@@ -789,7 +863,7 @@ def java_root_aliases(home: Path) -> list[str]:
 def probe_java_home(home: Path, chain, timeout: float, classes: Path) -> tuple[bool, str]:
     r = sh([str(home / "bin" / "java"), "-cp", str(classes), "HttpsCheck", chain.url],
            timeout=timeout + 10)
-    return r.out.startswith("OK"), first_line(r.out) or first_line(r.err)
+    return classify(r.out.startswith("OK"), first_line(r.out) or first_line(r.err))
 
 
 def export_cacerts(home: Path, cache: Path) -> Path | None:
@@ -831,10 +905,10 @@ def t_java(ctx: Ctx) -> list[Result]:
             local = ctx.java_local(home, classes)
 
         if local:
-            accepted, total, detail = local
+            accepted, total, detail, errors = local
             result = Result("java", label, version=version, store=store,
                             method="live handshake, local lab",
-                            accepted=accepted, total=total,
+                            accepted=accepted, errors=errors, total=total,
                             note=detail, group="runtime")
         else:
             bundle = export_cacerts(home, ctx.cache)
@@ -866,9 +940,9 @@ def t_ruby(ctx: Ctx) -> Result:
     store = first_line(r.out)
     local = ctx.local().get("ruby") if ctx.mode == "local" else None
     if local:
-        accepted, total, detail = local
+        accepted, total, detail, errors = local
         return Result("ruby", "Ruby", version=version, store=store,
-                      method="live handshake, local lab", accepted=accepted,
+                      method="live handshake, local lab", accepted=accepted, errors=errors,
                       total=total, note=detail, group="runtime")
     if store and Path(store).is_file():
         accepted, total = ctx.bundle_counts(Path(store))
@@ -915,8 +989,9 @@ def count_marker(path: Path, needle: bytes, chunk: int = 8 << 20) -> int:
             block = fh.read(chunk)
             if not block:
                 break
-            total += (tail + block).count(needle)
-            tail = block[-(len(needle) - 1):] if len(block) >= len(needle) else block
+            data = tail + block
+            total += data.count(needle)
+            tail = data[max(0, len(data) - (len(needle) - 1)):]
     return total
 
 
@@ -976,30 +1051,15 @@ def fix_for(version: str, fixed: str) -> str:
     return ".".join(str(part) for part in candidates[-1])
 
 
-def electron_patched(version: str, candidates: list[tuple[int, ...]]) -> bool:
-    """The fix list is per major line: 42.11.16, 43.8.1, 44.9.1.
-
-    A 44.x app needs 44.9.1, not 42.11.16; an app on a retired line (38.x)
-    needs to move to any supported one.
-    """
-    value = vnum(version)
-    if not value or not candidates:
-        return False
-    if value > max(candidates):
-        return True
-    same_line = [c for c in candidates if c[0] == value[0]]
-    return bool(same_line) and value >= max(same_line)
-
-
 def t_electron(ctx: Ctx) -> Result:
     apps = electron_apps(deep=getattr(ctx.args, 'deep', False))
     if not apps:
         return Result("electron", "Electron", installed=False)
     fixed = ctx.patched.get("Electron", "")
-    candidates = [vnum(c) for c in fixed.split(",") if vnum(c)]
+    candidates = fixed_candidates(fixed)
     outdated = 0
     for app in apps:
-        app["patched"] = electron_patched(app["electron"], candidates)
+        app["patched"] = bool(version_patched(app["electron"], candidates))
         app["fix"] = fix_for(app["electron"], fixed)
         if not app["patched"]:
             outdated += 1
@@ -1190,7 +1250,7 @@ def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
     out.append("=" * 78)
     out.append(f"started   {time.strftime('%Y-%m-%d %H:%M:%S %z')}")
     out.append(f"mode      {ctx.mode}" + (
-        f"  ({len(ctx.servers)} chains served on 127.0.0.1)" if ctx.servers else
+        f"  ({len(ctx.servers)} chains served on 127.0.0.1 and ::1)" if ctx.servers else
         "  (bundles only, no sockets)"))
     out.append(f"chains    {len(ctx.chain_files)} from {ctx.chains_dir}")
     out.append("")
@@ -1230,6 +1290,9 @@ def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
     if unknown:
         out.append("")
         out.append("Unresolved: " + ", ".join(f"{r.name} {r.version}".strip() for r in unknown))
+        for r in unknown:
+            if r.errors and r.note:
+                out.append(f"  - {r.name}: {r.errors}/{r.total} probes errored: {shorten(r.note, 60)}")
 
     missing = [r for r in results if not r.installed]
     if missing:
@@ -1304,7 +1367,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--mode", choices=["local", "offline"], default="local",
                         help="local lab handshakes (default) or bundle checks only")
-    parser.add_argument("--chains", default=str(ROOT / "disclosure" / "chains"))
+    parser.add_argument("--chains", help="directory or zip with the twelve chains "
+                        "(default: disclosure/chains/, else disclosure/emudhra-test-host-chains.zip)")
     parser.add_argument("--disclosure", default=str(find_disclosure() or ""))
     parser.add_argument("--keys", help="zip or directory with the recovered CA keys")
     parser.add_argument("--timeout", type=float, default=8.0)
@@ -1321,12 +1385,22 @@ def main(argv: list[str] | None = None) -> int:
     wanted = {part.strip() for part in args.only.split(",") if part.strip()}
 
     started = time.time()
-    ctx = Ctx(args)
+    try:
+        ctx = Ctx(args)
+    except LabError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if args.top:
         ctx.chain_files = ctx.chain_files[: args.top]
 
+    # Turn SIGTERM / SIGHUP into SystemExit so `finally` removes the lab.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(130))
+
     results: list[Result] = []
     try:
+        if ctx.mode == "offline" and CACHE.is_dir():
+            sweep_stale(CACHE)
         if ctx.mode == "local":
             try:
                 ctx.start_lab()

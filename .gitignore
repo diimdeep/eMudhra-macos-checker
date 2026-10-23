@@ -8,11 +8,22 @@ __pycache__/
 checking/.cache/
 checking/report.json
 
-# research material and key material, not part of the tool
-breadcrums/*
-!breadcrums/emudrahahahahaha-main.zip
+# research material, not part of the tool
+breadcrums/
+
+# keys/ ships only the archive; the lab extracts it into a temp dir, but a
+# manual unzip next to it must not be committed
+keys/*/
+
+# local copies of the disclosure's downloads; the chains zip is the tool's
+# input and stays tracked
 disclosure/*.zip
+!disclosure/emudhra-test-host-chains.zip
 
 # third-party snapshot and proof bundle, not needed by the tool
 disclosure/proof/
 disclosure/*.html
+
+# the chains ship as disclosure/emudhra-test-host-chains.zip; an unzipped copy
+# here takes precedence but is not committed
+disclosure/chains/*.pem

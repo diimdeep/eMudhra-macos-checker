@@ -7,7 +7,7 @@ private keys, so the only way to ask an installed TLS client "do you still
 trust this CA?" is to talk to one of those hosts over the internet.
 
 We do have the eight compromised intermediate CA private keys (recovered from
-the certificates themselves, see breadcrums/emudrahahahahaha-main.zip).  With
+the certificates themselves, see keys/emudhra-intermediate-ca-keys.zip).  With
 those we can mint our own leaf certificate for localhost / 127.0.0.1 under each
 intermediate, serve it from a loopback port, and let every client connect to
 it.  No DNS, no third-party host, no internet.
@@ -19,7 +19,11 @@ published chain includes it) is served exactly as captured.
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import http.server
+import os
+import re
 import secrets
 import shutil
 import socket
@@ -33,8 +37,11 @@ from pathlib import Path
 
 CERT_RE = r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----"
 
-KEY_ARCHIVE = "emudrahahahahaha-main.zip"
-KEY_DIR = "emudrahahahahaha-main"
+CHAINS_DIR = Path("disclosure") / "chains"
+CHAINS_ARCHIVE = Path("disclosure") / "emudhra-test-host-chains.zip"
+
+KEY_ARCHIVE = "emudhra-intermediate-ca-keys.zip"
+KEY_DIR = "emudhra-intermediate-ca-keys"
 
 EXT_CONF = """\
 basicConstraints       = critical, CA:FALSE
@@ -77,14 +84,37 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class _HTTPS(http.server.ThreadingHTTPServer):
+    """Accept plain TCP and run the TLS handshake in the request thread, so a
+    client that stalls mid-handshake cannot block the others."""
+
+    daemon_threads = True
+
+    def __init__(self, host: str, port: int, ctx: ssl.SSLContext):
+        self.address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        self.tls = ctx
+        super().__init__((host, port), _Handler)
+
+    def finish_request(self, request, client_address):
+        request.settimeout(10)
+        try:
+            tls = self.tls.wrap_socket(request, server_side=True)
+        except OSError:  # the client refused our chain; that is its answer
+            return
+        try:
+            self.RequestHandlerClass(tls, client_address, self)
+        finally:
+            tls.close()
+
+    def handle_error(self, request, client_address):
+        pass
+
+
 class _Server(threading.Thread):
-    def __init__(self, chain_path: Path, key_path: Path):
+    def __init__(self, httpd: _HTTPS):
         super().__init__(daemon=True)
-        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(str(chain_path), str(key_path))
-        self.httpd.socket = ctx.wrap_socket(self.httpd.socket, server_side=True)
-        self.port = self.httpd.server_address[1]
+        self.httpd = httpd
+        self.port = httpd.server_address[1]
         self.ready = threading.Event()
 
     def run(self):
@@ -96,9 +126,80 @@ class _Server(threading.Thread):
         self.httpd.server_close()
 
 
-def split_pem(text: str) -> list[str]:
-    import re
+def _bind_pair(ctx: ssl.SSLContext) -> list[_HTTPS]:
+    """Bind 127.0.0.1 and ::1 on the same port, since clients resolve
+    `localhost` to either.  Without an IPv6 loopback, serve IPv4 only."""
+    for _ in range(20):
+        v4 = _HTTPS("127.0.0.1", 0, ctx)
+        try:
+            v6 = _HTTPS("::1", v4.server_address[1], ctx)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                v4.server_close()
+                continue
+            return [v4]
+        return [v4, v6]
+    raise LabError("could not bind a port on both 127.0.0.1 and ::1")
 
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def sweep_stale(cache: Path) -> None:
+    """Remove lab directories left by runs that were killed before cleanup."""
+    for workdir in cache.glob("lab-*"):
+        try:
+            pid = int((workdir / "owner.pid").read_text())
+        except (OSError, ValueError):
+            pid = 0
+        if not pid or not _pid_alive(pid):
+            shutil.rmtree(workdir, ignore_errors=True)
+
+
+def resolve_chains(root: Path, cache: Path, chains: str | Path | None = None) -> Path:
+    """Directory holding the twelve chain PEMs.
+
+    `chains` may be a directory or a zip.  By default use disclosure/chains/
+    when it has PEMs, else the tracked disclosure zip.  A zip is extracted
+    once into cache/chains-<hash>/, so concurrent runs share it safely.
+    """
+    if chains:
+        source = Path(chains).expanduser().resolve()
+    elif any((root / CHAINS_DIR).glob("*.pem")):
+        source = root / CHAINS_DIR
+    else:
+        source = root / CHAINS_ARCHIVE
+    if source.is_dir():
+        return source
+    if not source.is_file():
+        raise LabError(f"no chains: {source} not found; pass --chains DIR or ZIP")
+
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
+    target = cache / f"chains-{digest}"
+    if not target.is_dir():
+        cache.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix="chains-tmp-", dir=cache))
+        with zipfile.ZipFile(source) as zf:
+            for member in zf.namelist():
+                if member.endswith(".pem") and not member.startswith(("/", "..")):
+                    (staging / Path(member).name).write_bytes(zf.read(member))
+        try:
+            staging.rename(target)
+        except OSError:  # another run got there first
+            shutil.rmtree(staging, ignore_errors=True)
+    if not any(target.glob("*.pem")):
+        raise LabError(f"{source} contains no .pem chains")
+    return target
+
+
+def split_pem(text: str) -> list[str]:
     return re.findall(CERT_RE, text, re.S)
 
 
@@ -130,6 +231,7 @@ class Lab:
         self.workdir: Path | None = None
         self.chains: list[Chain] = []
         self._servers: list[_Server] = []
+        self._leaf_keys: dict[str, Path] = {}
         self.skip: list[str] = []
 
     # -- material ---------------------------------------------------------
@@ -146,7 +248,7 @@ class Lab:
         """Map CA common name -> (certificate, private key) on disk.
 
         `keys` may point at the extracted directory or the zip; by default we
-        look for it under breadcrums/ next to the disclosure.
+        look for it under keys/ at the repo root.
         """
         if self.keys is not None:
             if self.keys.is_dir():
@@ -156,9 +258,9 @@ class Lab:
             else:
                 raise LabError(f"keys path not found: {self.keys}")
         else:
-            keys_dir = self.root / "breadcrums" / KEY_DIR
+            keys_dir = self.root / "keys" / KEY_DIR
             if not keys_dir.is_dir():
-                archive = self.root / "breadcrums" / KEY_ARCHIVE
+                archive = self.root / "keys" / KEY_ARCHIVE
                 if not archive.is_file():
                     raise LabError(
                         f"no recovered CA keys: expected {keys_dir} or {archive}; "
@@ -219,7 +321,9 @@ class Lab:
     def prepare(self, chains_dir: Path, files: list[Path] | None = None) -> list[Chain]:
         """Mint leaves for every captured chain and write servable PEM files."""
         self.cache.mkdir(parents=True, exist_ok=True)
+        sweep_stale(self.cache)
         self.workdir = Path(tempfile.mkdtemp(prefix="lab-", dir=self.cache))
+        (self.workdir / "owner.pid").write_text(str(os.getpid()))
         material = self._key_material()
 
         for chain_file in (files if files is not None else sorted(chains_dir.glob("*.pem"))):
@@ -252,7 +356,6 @@ class Lab:
             served = self.workdir / f"{name}.pem"
             served.write_text(leaf_pem.read_text().rstrip() + "\n" + "\n".join(blocks[1:]) + "\n")
             self.chains.append(Chain(name=name, ca_cn=icn, path=served))
-            self._leaf_keys = getattr(self, "_leaf_keys", {})
             self._leaf_keys[name] = leaf_key
 
         if not self.chains:
@@ -261,11 +364,14 @@ class Lab:
 
     def start(self) -> list[Chain]:
         for chain in self.chains:
-            srv = _Server(chain.path, self._leaf_keys[chain.name])
-            srv.start()
-            srv.ready.wait(2)
-            chain.port = srv.port
-            self._servers.append(srv)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(str(chain.path), str(self._leaf_keys[chain.name]))
+            for httpd in _bind_pair(ctx):
+                srv = _Server(httpd)
+                srv.start()
+                srv.ready.wait(2)
+                chain.port = srv.port
+                self._servers.append(srv)
         for chain in self.chains:
             with socket.create_connection(("127.0.0.1", chain.port), timeout=2):
                 pass

@@ -10,28 +10,34 @@ is older than the certifi release that dropped the compromised eMudhra roots,
 plugins keep trusting them.  Replacing the file breaks the code signature, so
 the bundle has to be signed again; an ad-hoc signature is enough for local use.
 
-    python3 checking/patch.py --dry-run     # show what would happen
-    python3 checking/patch.py               # patch every Sublime install
-    python3 checking/patch.py --restore     # put the original bundle back
+    python3 checking/patch_sublime.py --dry-run     # show what would happen
+    python3 checking/patch_sublime.py               # patch every Sublime install
+    python3 checking/patch_sublime.py --restore     # put the original bundle back
 
 Quit Sublime before running this.  App updates replace the bundle, so re-run
 after every update.  Re-signing changes the app's identity: macOS may ask for
 privacy permissions again, and Gatekeeper will no longer see a notarized
-signature (the app still launches).
+signature (the app still launches).  --restore puts the original files back
+but keeps the ad-hoc signature; reinstall Sublime to get the vendor's back.
 """
 
 from __future__ import annotations
 
 import argparse
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import NoReturn
 
-ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CHAINS = ROOT / "disclosure" / "chains"
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+sys.path.insert(0, str(HERE))
+
+from lab import LabError, resolve_chains  # noqa: E402
+
 CERTIFI_REL = Path("Contents") / "MacOS" / "Lib" / "python3" / "certifi"
 DEFAULT_BACKUP = Path.home() / "Library" / "Application Support" / "emudhra-check" / "sublime"
 
@@ -90,6 +96,10 @@ def read_certifi_version(package: Path) -> str:
         if line.startswith("__version__"):
             return line.split("=", 1)[1].strip().strip("\"'")
     return "?"
+
+
+def vnum(text: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", text))
 
 
 def accepted_chains(bundle: Path, chains: list[Path]) -> tuple[int, int]:
@@ -151,7 +161,7 @@ def choose_source(explicit: str | None, chains: list[Path]) -> Path:
         good, total = accepted_chains(package / "cacert.pem", chains)
         version = read_certifi_version(package)
         print(f"  candidate {version:<12} accepts {good}/{total}  {package}")
-        if good == 0 and (best is None or version > read_certifi_version(best[1])):
+        if good == 0 and (best is None or vnum(version) > vnum(read_certifi_version(best[1]))):
             best = (good, package)
     if best is None:
         fail("no installed certifi bundle rejects all chains; pass --source")
@@ -170,14 +180,15 @@ def sign(path: Path, dry: bool) -> bool:
 
 
 def install_package(source: Path, dest: Path) -> None:
-    """Copy only the certifi files the plugin host imports.
+    """Install a certifi package into `dest`, or a PEM bundle over its cacert.pem.
 
     Homebrew ships these as symlinks into its Cellar; dereference them, drop
     tests/__pycache__, and make everything writable so codesign can attach the
     per-file detached signatures macOS expects under Contents/MacOS.
     """
-    dest.mkdir(parents=True, exist_ok=True)
     if source.is_dir():
+        shutil.rmtree(dest, ignore_errors=True)
+        dest.mkdir(parents=True)
         for entry in sorted(source.iterdir()):
             if not entry.is_file():
                 continue
@@ -187,11 +198,10 @@ def install_package(source: Path, dest: Path) -> None:
             shutil.copy2(entry, target)  # copy2 follows symlinks
             target.chmod(0o644)
     else:
+        # A bare bundle replaces only the PEM; the package code stays.
         target = dest / "cacert.pem"
         shutil.copy2(source, target)
         target.chmod(0o644)
-    for entry in dest.iterdir():
-        entry.chmod(0o644)
 
 
 def resign(app: Path, dry: bool, package: Path | None = None) -> bool:
@@ -243,8 +253,6 @@ def patch_app(app: Path, source: Path, chains: list[Path], dry: bool,
         return True
 
     shutil.copytree(package, backup)
-
-    shutil.rmtree(package)
     install_package(source, package)
 
     good, total = accepted_chains(package / "cacert.pem", chains)
@@ -274,8 +282,8 @@ def restore_app(app: Path, chains: list[Path], backup_root: Path) -> bool:
 
     shutil.rmtree(package)
     shutil.copytree(backup, package)
-    for entry in package.iterdir():
-        entry.chmod(0o644)
+    for entry in package.rglob("*"):
+        entry.chmod(0o755 if entry.is_dir() else 0o644)
     shutil.rmtree(backup)
     good, total = accepted_chains(package / "cacert.pem", chains)
     print(f"{app.name}: restored certifi {read_certifi_version(package)} (accepts {good}/{total})")
@@ -291,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--app", action="append", default=[],
                         help="Sublime Text.app to patch (repeatable; default: all found)")
     parser.add_argument("--source", help="certifi package or PEM bundle to install")
-    parser.add_argument("--chains", default=str(DEFAULT_CHAINS))
+    parser.add_argument("--chains", help="directory or zip with the twelve chains")
     parser.add_argument("--restore", action="store_true", help="restore the original bundle")
     parser.add_argument("--backup-dir", default=str(DEFAULT_BACKUP),
                         help="where to keep the original bundle")
@@ -300,7 +308,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     args = parser.parse_args(argv)
 
-    chains_dir = Path(args.chains).expanduser().resolve()
+    try:
+        chains_dir = resolve_chains(ROOT, HERE / ".cache", args.chains)
+    except LabError as exc:
+        fail(str(exc))
     chains = sorted(chains_dir.glob("*.pem"))
     if not chains:
         fail(f"no chains in {chains_dir}")
