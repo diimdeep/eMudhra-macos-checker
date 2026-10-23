@@ -1,6 +1,6 @@
 # checking/
 
-Does this Mac still trust the compromised eMudhra intermediate CAs?
+Doesthis Mac still trust the compromised eMudhra intermediate CAs?
 
 `local` mode completes real TLS handshakes against a loopback lab; `offline`
 inspects CA bundles with `openssl verify`.
@@ -32,7 +32,6 @@ python3 checking/check_trust.py --json          # write checking/report.json
 | `--top N` | test only the first N chains (debugging) |
 | `--timeout S` | per-probe timeout (default 8) |
 
-Exit `0` when nobody accepts, `1` when someone does, `2` on a setup error.
 
 ## How it works
 

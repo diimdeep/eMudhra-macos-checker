@@ -1,11 +1,9 @@
 # eMudhra macOS checker
 
-Does this Mac still trust the compromised eMudhra intermediate CAs?
+Does Mac still trust the compromised eMudhra intermediate CAs?
 
 In October 2026, eight eMudhra intermediate CA keys turned out to be recoverable
-from their public certificates. Browsers dropped them; much developer tooling
-did not. This repo asks each installed TLS client to complete a real handshake
-against a certificate issued under one of those CAs.
+from their public certificates. This repo asks each installed TLS client to complete a real handshake against a certificate issued under one of those CAs, locally.
 
 Background: [disclosure site](https://emudhra.we-have-a-problem.com/) ·
 [source](https://github.com/galadran/we-have-a-problem.com).
@@ -19,7 +17,6 @@ Background: [disclosure site](https://emudhra.we-have-a-problem.com/) ·
 3. `checking/check_trust.py` connects with every installed client and records
    who accepts.
 
-No DNS, no third party, no guessing from CA bundle contents.
 
 ## Run
 
@@ -35,7 +32,6 @@ NSS                      ...       libnssckbi (built-in roots)  version    patch
 Electron                 N apps    Chromium + CRLSets           version    outdated
 ```
 
-Exit `0` when nobody accepts, `1` when someone does, `2` on a setup error.
 
 ## Two modes
 
@@ -44,8 +40,6 @@ Exit `0` when nobody accepts, `1` when someone does, `2` on a setup error.
 | `local` (default) | real TLS handshake per client per chain | keys |
 | `offline` | `openssl verify` against each client's bundle | chains only |
 
-`offline` suits environments without sockets. It is weaker: it shows what a
-store contains, not what the client does with it.
 
 ## Layout
 
@@ -60,11 +54,6 @@ breadcrums/            eight recovered CA keys (zip)
 macOS, Python 3 (standard library only), `openssl` on `PATH`. `codesign` only
 for the patcher.
 
-## Limits
-
-Apple's CT policy masks leaf checks; Go rejects these certificates as
-non-compliant; Electron is version-only. Details in
-[checking/README.md](checking/README.md).
 
 ## Also here
 
@@ -76,5 +65,4 @@ non-compliant; Electron is version-only. Details in
 ## About the keys
 
 Included so the lab runs out of the box. They are derivable from the public
-certificates in milliseconds, so this adds no exposure. `--keys` points at
-another copy.
+certificates in milliseconds, so this adds no exposure.
