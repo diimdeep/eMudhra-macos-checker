@@ -47,6 +47,7 @@ check where the client has a readable bundle.
 | `pythons` | other Python 3 interpreters | `python3*` on `PATH`, Homebrew `python@*`, python.org framework, pyenv, `/usr/bin/python3` | handshake per interpreter; bundle for its certifi |
 | `apps` | CA files inside app bundles | `cacert.pem`, `ca-bundle.crt`, `ca-certificates.crt`, `curl-ca-bundle.crt` in any app found above | bundle per file |
 | `venvs` | certifi copies in venvs and user site-packages | Spotlight search under home and every `--scan DIR` | bundle per copy |
+| `chromium` | Chromium-family browsers (Chromium, Chrome, Brave, Edge, Vivaldi, Yandex) | found by bundle id among the apps above; each chain is loaded over DevTools (`--headless=new --remote-debugging-port=0`) in a throwaway profile seeded with the real profile's `CertificateRevocation` and `PKIMetadata` | handshake per browser |
 | `rust` | Rust rustls-webpki / webpki-roots | `rustc` present; crates not inspected | version |
 | `composer` | Composer ca-bundle | `composer` on `PATH` | version of `composer`, not of its bundle |
 | `elixir` | Elixir castore | `elixir` on `PATH` | version of `elixir`, not of castore |
@@ -54,8 +55,12 @@ check where the client has a readable bundle.
 | `cfssl` | Cloudflare CFSSL trust store | `cfssl` on `PATH` | detected only |
 | `ubuntu` `debian` `arch` `gentoo` `fedora` `freebsd` `chainguard` `alpine` | distribution `ca-certificates` | `/etc/os-release` | `-` on macOS |
 
-Browsers (Safari, Chrome, Chromium, Firefox, LibreWolf, Tor Browser, Edge,
-Brave, Opera, Vivaldi) are listed with their versions but not tested.
+The `chromium` row counts `ERR_CERTIFICATE_TRANSPARENCY_REQUIRED` as trusted:
+the chain verified to a trusted root and only the lab leaf's missing CT proofs
+stopped the page, which a key holder can obtain.
+
+Other browsers (Safari, Firefox, LibreWolf, Tor Browser, Opera) are listed with
+their versions but not tested.
 
 
 ## Run
@@ -84,7 +89,7 @@ Electron                 N apps    version   outdated     Chromium root store + 
 ## Layout
 
 ```
-checking/              checker, lab, Sublime plugin and patcher
+checking/              checker, lab, keychain distrust, Sublime plugin and patcher
 disclosure/            twelve captured chains (emudhra-test-host-chains.zip)
 keys/                  eight recovered CA keys and certificates (zip)
 KEYS.md                how keys, certificates, chains and test hosts relate
@@ -98,6 +103,12 @@ for the patcher.
 
 ## Also here
 
+- Distrust the 14 compromised intermediates in the keychain:
+  `python3 checking/distrust_keychain.py` sets Never Trust per certificate,
+  asking first. `--admin` uses the System keychain, `--undo` reverts,
+  `--list` shows state. Chromium on macOS honors local distrust, which should
+  cover Chrome, Edge, Brave, Opera, Vivaldi, Yandex and Electron apps that use
+  the system verifier.
 - Check from inside Sublime: `python3 checking/serve_lab.py --install-plugin`,
   then “eMudhra: check local trust”.
 - Patch Sublime: `python3 checking/patch_sublime.py` swaps its bundled certifi

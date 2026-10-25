@@ -27,6 +27,7 @@ connection, client crash) is reported as unknown, never as a rejection.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import platform
@@ -36,11 +37,14 @@ import shutil
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1413,6 +1417,260 @@ def t_venvs(ctx: Ctx) -> list[Result]:
     return results
 
 
+# bundle id -> user data folder under ~/Library/Application Support
+CHROMIUM_FAMILY = {
+    "org.chromium.Chromium": "Chromium",
+    "com.google.Chrome": "Google/Chrome",
+    "com.brave.Browser": "BraveSoftware/Brave-Browser",
+    "com.microsoft.edgemac": "Microsoft Edge",
+    "com.vivaldi.Vivaldi": "Vivaldi",
+    "ru.yandex.desktop.yandex-browser": "Yandex/YandexBrowser",
+}
+
+# Component-updater data that changes verification: CRLSets, the CT log list
+# and Chrome Root Store updates.  A fresh profile lacks them, so they are
+# copied from the real profile to judge the browser as the user runs it.
+CHROMIUM_COMPONENTS = ("CertificateRevocation", "PKIMetadata")
+
+CHROMIUM_REJECT = {"ERR_CERT_AUTHORITY_INVALID", "ERR_CERT_REVOKED", "ERR_CERT_INVALID",
+                   "ERR_CERT_KNOWN_INTERCEPTION_BLOCKED", "ERR_CERT_SYMANTEC_LEGACY"}
+
+
+def chromium_browsers() -> list[dict]:
+    found = []
+    for app in app_bundles():
+        meta = read_plist(app / "Contents" / "Info.plist")
+        data = CHROMIUM_FAMILY.get(meta.get("CFBundleIdentifier", ""))
+        binary = app / "Contents" / "MacOS" / meta.get("CFBundleExecutable", "")
+        if data is None or not binary.is_file():
+            continue
+        found.append({
+            "app": app,
+            "binary": binary,
+            "version": meta.get("CFBundleShortVersionString", ""),
+            "data": Path.home() / "Library" / "Application Support" / data,
+        })
+    return found
+
+
+def chromium_verdict(out: str, err: str) -> tuple[bool | None, str]:
+    if "eMudhra local trust lab" in out:
+        return True, "page loaded"
+    codes = sorted(set(re.findall(r"ERR_[A-Z_]+", out + err)))
+    if "ERR_CERTIFICATE_TRANSPARENCY_REQUIRED" in codes:
+        # The chain verified to a trusted root; only the lab leaf's missing
+        # CT proofs stopped it, and a key holder can get those.
+        return True, "ERR_CERTIFICATE_TRANSPARENCY_REQUIRED: chain trusted, blocked only by CT"
+    hit = [c for c in codes if c in CHROMIUM_REJECT]
+    if hit:
+        return False, hit[0]
+    tail = err.strip().splitlines()[-1] if err.strip() else ""
+    return None, " ".join(codes) or tail or "no page and no error code"
+
+
+class DevTools:
+    """Just enough of a WebSocket client to drive one DevTools page target, without the
+    third-party `websockets` package so the checker stays stdlib-only.
+    """
+    def __init__(self, ws_url: str, timeout: float):
+        url = urllib.parse.urlsplit(ws_url)
+        self.sock = socket.create_connection((url.hostname, url.port), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {url.path} HTTP/1.1\r\nHost: {url.netloc}\r\n"
+                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        self.buf = b""
+        while b"\r\n\r\n" not in self.buf:
+            self.buf += self._recv()
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        if b" 101 " not in head.split(b"\r\n", 1)[0]:
+            raise ConnectionError(head.split(b"\r\n", 1)[0].decode(errors="replace"))
+        self.next_id = 0
+
+    def _recv(self) -> bytes:
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("DevTools socket closed")
+        return chunk
+
+    def _read(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            self.buf += self._recv()
+        data, self.buf = self.buf[:n], self.buf[n:]
+        return data
+
+    def _send(self, opcode: int, payload: bytes) -> None:
+        n = len(payload)
+        head = bytes([0x80 | opcode])
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < 1 << 16:
+            head += bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            head += bytes([0x80 | 127]) + struct.pack(">Q", n)
+        mask = os.urandom(4)
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def _message(self) -> dict:
+        parts = []
+        while True:
+            b0, b1 = self._read(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            payload = self._read(n)
+            opcode = b0 & 0x0F
+            if opcode == 8:
+                raise ConnectionError("DevTools socket closed")
+            if opcode == 9:
+                self._send(10, payload)
+                continue
+            if opcode in (0, 1, 2):
+                parts.append(payload)
+                if b0 & 0x80:
+                    return json.loads(b"".join(parts))
+
+    def call(self, method: str, **params) -> dict:
+        self.next_id += 1
+        self._send(1, json.dumps({"id": self.next_id, "method": method,
+                                  "params": params}).encode())
+        while True:
+            msg = self._message()
+            if msg.get("id") == self.next_id:
+                if "error" in msg:
+                    raise RuntimeError(f"{method}: {msg['error'].get('message')}")
+                return msg["result"]
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+def load_page(binary: Path, profile: Path, url: str, timeout: float) -> tuple[str, str] | None:
+    """Page DOM (or the navigation error) and stderr, or None on timeout.
+
+    Drives the browser over DevTools instead of --dump-dom, which some forks
+    (Yandex) accept but never answer.  Port 0 lets parallel probes coexist;
+    the browser reports its port in DevToolsActivePort.  It gets its own
+    process group so cleanup also ends its renderer and GPU helpers.
+    """
+    deadline = time.monotonic() + timeout
+    log = tempfile.TemporaryFile("w+")
+    proc = subprocess.Popen(
+        [str(binary), "--headless=new", f"--user-data-dir={profile}", "--no-first-run",
+         "--no-default-browser-check", "--disable-gpu", "--disable-extensions",
+         "--remote-debugging-port=0", "about:blank"],
+        stdout=subprocess.DEVNULL, stderr=log, text=True, start_new_session=True)
+    try:
+        port_file = profile / "DevToolsActivePort"
+        while not (port_file.is_file() and port_file.read_text().count("\n") >= 1):
+            if proc.poll() is not None or time.monotonic() > deadline:
+                return None
+            time.sleep(0.1)
+        port = port_file.read_text().split()[0]
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/json/new?about:blank", method="PUT")
+        # Bypass any http_proxy setting; the endpoint is loopback.
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=5) as resp:
+            tab = json.load(resp)
+        page = DevTools(tab["webSocketDebuggerUrl"], max(deadline - time.monotonic(), 1))
+        try:
+            nav = page.call("Page.navigate", url=url)
+            if nav.get("errorText"):
+                out = nav["errorText"]
+            else:
+                out = page.call("Runtime.evaluate", awaitPromise=True, returnByValue=True,
+                                expression="new Promise(r => document.readyState === 'complete'"
+                                           " ? r() : addEventListener('load', r))"
+                                           ".then(() => document.documentElement.outerHTML)"
+                                )["result"].get("value", "")
+        finally:
+            page.close()
+    except (OSError, ValueError, KeyError, RuntimeError):
+        return None
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        log.seek(0)
+        err = log.read()
+        log.close()
+    return out, err
+
+
+def headless_works(browser: dict, work: Path) -> bool:
+    profile = Path(tempfile.mkdtemp(prefix="preflight-", dir=work))
+    try:
+        result = load_page(browser["binary"], profile, "data:text/html,<p>emudhra-preflight</p>", 20)
+        return result is not None and "emudhra-preflight" in result[0]
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def p_chromium(browser: dict, seed: Path, chain, timeout) -> tuple[bool | None, str]:
+    profile = Path(tempfile.mkdtemp(prefix="profile-", dir=seed.parent))
+    try:
+        for name in CHROMIUM_COMPONENTS:
+            if (seed / name).is_dir():
+                shutil.copytree(seed / name, profile / name)
+        result = load_page(browser["binary"], profile, chain.url, timeout + 30)
+        if result is None:
+            return None, "timed out"
+        return chromium_verdict(*result)
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def t_chromium(ctx: Ctx) -> list[Result]:
+    browsers = chromium_browsers()
+    if not browsers:
+        return [Result("chromium", "Chromium-family browsers", installed=False)]
+    results: list[Result] = []
+    for browser in browsers:
+        label = app_label(browser["app"])
+        seeded = [n for n in CHROMIUM_COMPONENTS
+                  if (browser["data"] / n).is_dir() and any((browser["data"] / n).iterdir())]
+        updates = ("component data copied from the real profile: " + ", ".join(seeded)
+                   if seeded else "no CRLSet / root-store component data in the real profile")
+        common = dict(version=browser["version"], store="Chrome Root Store + CRLSets",
+                      group="browser", items=[{"app": str(browser["app"])}])
+        if not (ctx.mode == "local" and ctx.servers):
+            results.append(Result("chromium", f"{label} (headless)", method="n/a",
+                                  note="needs the local lab", **common))
+            continue
+        work = Path(tempfile.mkdtemp(prefix="chromium-", dir=CACHE))
+        try:
+            progress.detail(f"checking that {label} runs headless")
+            if not headless_works(browser, work):
+                results.append(Result("chromium", f"{label} (headless)", method="n/a",
+                                      note="headless DevTools session failed; not testable",
+                                      **common))
+                continue
+            seed = work / "seed"
+            seed.mkdir()
+            for name in seeded:
+                shutil.copytree(browser["data"] / name, seed / name)
+            accepts: list[str] = []
+
+            def probe(chain, timeout):
+                ok, detail = p_chromium(browser, seed, chain, timeout)
+                if ok:
+                    accepts.append(detail)
+                return ok, detail
+
+            accepted, total, detail, errors = ctx.run_probe(probe, label)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        if accepted:
+            detail = accepts[0]
+        results.append(Result("chromium", f"{label} (headless)",
+                              method="live handshake, local lab", accepted=accepted,
+                              total=total, errors=errors, note=f"{detail}; {updates}", **common))
+    return results
+
+
 def t_os_package(ctx: Ctx, key: str, name: str, distro: str) -> Result:
     if sys.platform != "linux":
         return Result(key, name, installed=False, note="not a Linux system")
@@ -1430,6 +1688,7 @@ TECHS = [
     ("bun", t_bun), ("deno", t_deno), ("go", t_go), ("java", t_java), ("ruby", t_ruby),
     ("nss", t_nss), ("electron", t_electron), ("sublime", t_sublime),
     ("pythons", t_pythons), ("apps", t_app_bundles), ("venvs", t_venvs),
+    ("chromium", t_chromium),
     ("rust", t_rust),
     ("composer", t_composer), ("elixir", t_elixir), ("perl", t_perl),
     ("cfssl", t_cfssl),
@@ -1466,6 +1725,7 @@ FIXED_LOOKUP = {
     "pythons": None,
     "apps": None,
     "venvs": None,
+    "chromium": None,
     "rust": "Rust rustls-webpki",
     "composer": "Composer ca-bundle",
     "elixir": "Elixir castore",
@@ -1552,6 +1812,8 @@ def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
         for r in unknown:
             if r.errors and r.note:
                 out.append(f"  - {r.name}: {r.errors}/{r.total} probes errored: {r.note}")
+            elif r.note:
+                out.append(f"  - {r.name}: {r.note}")
 
     missing = [r for r in results if not r.installed]
     if missing:
@@ -1575,7 +1837,9 @@ def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
             )
 
     out.append("")
-    browsers = installed_browsers()
+    tested = {item["app"] for r in results if r.key == "chromium" and r.method.startswith("live")
+              for item in r.items}
+    browsers = [(name, ver) for name, ver, path in installed_browsers() if path not in tested]
     if browsers:
         out.append("Browsers installed (not exercised; they use their own root programmes):")
         out.append("  " + ", ".join(f"{name} {ver}".strip() for name, ver in browsers))
@@ -1587,7 +1851,7 @@ BROWSER_NAMES = ("Safari", "Chrome", "Chromium", "Firefox", "LibreWolf",
                  "Tor Browser", "Edge", "Brave", "Opera", "Vivaldi")
 
 
-def installed_browsers() -> list[tuple[str, str]]:
+def installed_browsers() -> list[tuple[str, str, str]]:
     found = []
     for base in (Path("/Applications"), Path.home() / "Applications"):
         if not base.is_dir():
@@ -1604,7 +1868,7 @@ def installed_browsers() -> list[tuple[str, str]]:
                     version = plistlib.load(fh).get("CFBundleShortVersionString", "")
             except Exception:  # noqa: BLE001
                 pass
-            found.append((app.stem, version))
+            found.append((app.stem, version, str(app)))
     return found
 
 
