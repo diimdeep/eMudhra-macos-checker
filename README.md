@@ -14,7 +14,7 @@ Background: [disclosure site](https://emudhra.we-have-a-problem.com/) ·
 python3 checking/check_trust.py
 ```
 
-![checker run](docs/run.webp)
+![checker run](docs/out.webp)
 
 
 ## Requirements
