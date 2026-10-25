@@ -1776,57 +1776,62 @@ def paint(text: str, code: str, on: bool) -> str:
     return f"\033[{code}m{text}\033[0m" if on else text
 
 
-def render(results: list[Result], ctx: Ctx, elapsed: float, columns: int | None = None,
-           color: bool = False) -> str:
-    cols = max(columns or shutil.get_terminal_size((120, 24)).columns, 60)
-    out = []
-    out.append("")
-    out.append("eMudhra intermediate CA compromise - local trust check")
-    out.append("=" * min(cols, 78))
-    out.append(f"started   {time.strftime('%Y-%m-%d %H:%M:%S %z')}")
-    out.append(f"mode      {ctx.mode}" + (
-        f"  ({len(ctx.servers)} chains on 127.0.0.1 and ::1)" if ctx.servers else
-        "  (bundles only, no sockets)"))
+class Table:
+    """Fixed-width results table, so rows can be printed as each probe finishes."""
+
+    def __init__(self, columns: int | None = None, color: bool = False) -> None:
+        self.cols = max(columns or shutil.get_terminal_size((120, 24)).columns, 60)
+        self.color = color
+        self.version, self.test, self.result = 14, 9, 12
+        # STORE appears only when the terminal leaves room for a useful path.
+        self.tech = 36
+        self.store = self.cols - (self.tech + self.version + self.test + self.result + 4)
+        self.show_store = self.store >= 24
+        if not self.show_store:
+            self.tech = self.cols - (self.version + self.test + self.result + 3)
+
+    def line(self, cells, paint_result: bool = False) -> str:
+        result = cells[3].ljust(self.result)
+        if paint_result:
+            result = paint(result, "31;1" if cells[3].startswith("TRUSTS") else
+                           "32" if cells[3].startswith("rejects") else "33", self.color)
+        text = " ".join([fit(cells[0], self.tech).ljust(self.tech),
+                         fit(cells[1], self.version).ljust(self.version),
+                         cells[2].ljust(self.test), result])
+        if self.show_store:
+            text += " " + fit(cells[4], self.store, middle=True)
+        return text.rstrip()
+
+    def header(self) -> list[str]:
+        head = self.line(("TECH", "VERSION", "TEST", "RESULT", "STORE"))
+        return [paint(head, "1", self.color), "-" * len(head)]
+
+    def row(self, r: Result) -> str:
+        return self.line((r.name, r.version or "-", method_short(r.method), accepted_text(r),
+                          r.store or "-"), True)
+
+
+def render_header(ctx: Ctx, table: Table) -> str:
+    cols = table.cols
+    out = ["", "eMudhra intermediate CA compromise - local trust check", "=" * min(cols, 78),
+           f"started   {time.strftime('%Y-%m-%d %H:%M:%S %z')}",
+           f"mode      {ctx.mode}" + (
+               f"  ({len(ctx.servers)} chains on 127.0.0.1 and ::1)" if ctx.servers else
+               "  (bundles only, no sockets)")]
     try:
         shown = str(Path(ctx.chains_dir).relative_to(ROOT))
     except ValueError:
         shown = str(ctx.chains_dir)
     out.append(f"chains    {len(ctx.chain_files)} from {fit(shown, cols - 20, middle=True)}")
     out.append("")
+    out.extend(table.header())
+    return "\n".join(out)
 
+
+def render_summary(results: list[Result], ctx: Ctx, elapsed: float, table: Table) -> str:
+    cols, color = table.cols, table.color
+    out = []
     installed = [r for r in results if r.installed]
-    installed.sort(key=lambda r: (r.verdict != "TRUSTS", r.group, r.name))
-
-    rows = [(r.name, r.version or "-", method_short(r.method), accepted_text(r), r.store or "-")
-            for r in installed]
-    titles = ("TECH", "VERSION", "TEST", "RESULT", "STORE")
-    widths = [max([len(t)] + [len(row[i]) for row in rows]) for i, t in enumerate(titles[:4])]
-    # TECH and VERSION shrink to fit; STORE appears only when there is room left.
-    widths[1] = min(widths[1], 14)
-    widths[0] = min(widths[0], cols - sum(widths[1:]) - 3)
-    used = sum(widths) + 3
-    store_width = cols - used - 1
-    show_store = store_width >= 24
-
-    def line(cells, paint_result=False) -> str:
-        parts = [fit(cells[0], widths[0]).ljust(widths[0]),
-                 fit(cells[1], widths[1]).ljust(widths[1]),
-                 cells[2].ljust(widths[2])]
-        result = cells[3].ljust(widths[3])
-        if paint_result:
-            result = paint(result, "31;1" if cells[3].startswith("TRUSTS") else
-                           "32" if cells[3].startswith("rejects") else "33", color)
-        parts.append(result)
-        text = " ".join(parts)
-        if show_store:
-            text += " " + fit(cells[4], store_width, middle=True)
-        return text.rstrip()
-
-    head = line(titles)
-    out.append(paint(head, "1", color))
-    out.append("-" * len(head))
-    out.extend(line(row, True) for row in rows)
-
     naive = [r for r in installed if r.verdict == "TRUSTS"]
     patched = [r for r in installed if r.verdict == "PATCHED"]
     unknown = [r for r in installed if r.verdict in ("UNKNOWN", "")]
@@ -1972,6 +1977,7 @@ def main(argv: list[str] | None = None) -> int:
 
     selected = [(key, tech) for key, tech in TECHS if not wanted or key in wanted]
     results: list[Result] = []
+    view = Table(color=sys.stdout.isatty() and not os.environ.get("NO_COLOR"))
     progress.start(enabled=False if args.no_progress else None)
     try:
         if ctx.mode == "offline" and CACHE.is_dir():
@@ -1986,6 +1992,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("hint: pass --keys PATH (zip or directory with the eight .pem/.key pairs), "
                       "or use --mode offline", file=sys.stderr)
                 return 2
+        progress.emit(render_header(ctx, view))
         for index, (key, tech) in enumerate(selected, 1):
             progress.step(index, len(selected), key)
             try:
@@ -2000,13 +2007,14 @@ def main(argv: list[str] | None = None) -> int:
                 if table and table in ctx.patched:
                     result.fixed = ctx.patched[table]
                 results.append(result.finalize())
+                if result.installed:
+                    progress.emit(view.row(result))
     finally:
         progress.done()
         ctx.stop_lab()
 
     elapsed = time.time() - started
-    print(render(results, ctx, elapsed,
-                 color=sys.stdout.isatty() and not os.environ.get("NO_COLOR")))
+    print(render_summary(results, ctx, elapsed, view))
 
     if args.json:
         payload = {

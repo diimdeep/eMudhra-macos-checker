@@ -30,6 +30,7 @@ class Progress:
         self._stop = threading.Event()
         self._tick = 0
         self._rows = 0  # terminal rows the last draw occupied
+        self._io = threading.Lock()
 
     def start(self, enabled: bool | None = None) -> None:
         self.enabled = sys.stderr.isatty() if enabled is None else enabled
@@ -62,6 +63,15 @@ class Progress:
             sys.stderr.flush()
             self._rows = 0
 
+    def emit(self, text: str) -> None:
+        """Print a line to stdout above the progress line."""
+        with self._io:
+            if self.enabled and self._rows:
+                sys.stderr.write(self._rewind())
+                sys.stderr.flush()
+                self._rows = 0
+            print(text, flush=True)
+
     def _rewind(self) -> str:
         """Back to the first row of the previous draw, then clear below."""
         up = f"\033[{self._rows - 1}A" if self._rows > 1 else ""
@@ -81,9 +91,10 @@ class Progress:
         if len(text) >= columns:
             keep = columns - 2
             text = text[:keep // 2] + "…" + text[len(text) - (keep - keep // 2):]
-        sys.stderr.write(self._rewind() + text)
-        sys.stderr.flush()
-        self._rows = 1
+        with self._io:
+            sys.stderr.write(self._rewind() + text)
+            sys.stderr.flush()
+            self._rows = 1
 
 
 progress = Progress()
