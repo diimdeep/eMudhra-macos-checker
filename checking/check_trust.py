@@ -41,6 +41,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import urllib.parse
@@ -1759,34 +1760,72 @@ def method_short(method: str) -> str:
     return "-"
 
 
-def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
+def fit(text: str, width: int, middle: bool = False) -> str:
+    """Cut text to width with an ellipsis, in the middle for paths."""
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    if not middle:
+        return text[:width - 1] + "…"
+    left = (width - 1) // 2
+    return text[:left] + "…" + text[len(text) - (width - 1 - left):]
+
+
+def paint(text: str, code: str, on: bool) -> str:
+    return f"\033[{code}m{text}\033[0m" if on else text
+
+
+def render(results: list[Result], ctx: Ctx, elapsed: float, columns: int | None = None,
+           color: bool = False) -> str:
+    cols = max(columns or shutil.get_terminal_size((120, 24)).columns, 60)
     out = []
     out.append("")
     out.append("eMudhra intermediate CA compromise - local trust check")
-    out.append("=" * 78)
+    out.append("=" * min(cols, 78))
     out.append(f"started   {time.strftime('%Y-%m-%d %H:%M:%S %z')}")
     out.append(f"mode      {ctx.mode}" + (
-        f"  ({len(ctx.servers)} chains served on 127.0.0.1 and ::1)" if ctx.servers else
+        f"  ({len(ctx.servers)} chains on 127.0.0.1 and ::1)" if ctx.servers else
         "  (bundles only, no sockets)"))
-    out.append(f"chains    {len(ctx.chain_files)} from {ctx.chains_dir}")
+    try:
+        shown = str(Path(ctx.chains_dir).relative_to(ROOT))
+    except ValueError:
+        shown = str(ctx.chains_dir)
+    out.append(f"chains    {len(ctx.chain_files)} from {fit(shown, cols - 20, middle=True)}")
     out.append("")
 
     installed = [r for r in results if r.installed]
     installed.sort(key=lambda r: (r.verdict != "TRUSTS", r.group, r.name))
 
-    # STORE is last and never cut, so long paths do not shift the other columns.
     rows = [(r.name, r.version or "-", method_short(r.method), accepted_text(r), r.store or "-")
             for r in installed]
     titles = ("TECH", "VERSION", "TEST", "RESULT", "STORE")
     widths = [max([len(t)] + [len(row[i]) for row in rows]) for i, t in enumerate(titles[:4])]
+    # TECH and VERSION shrink to fit; STORE appears only when there is room left.
+    widths[1] = min(widths[1], 14)
+    widths[0] = min(widths[0], cols - sum(widths[1:]) - 3)
+    used = sum(widths) + 3
+    store_width = cols - used - 1
+    show_store = store_width >= 24
 
-    def line(cells) -> str:
-        return " ".join(f"{c:<{w}}" for c, w in zip(cells, widths)) + " " + cells[4]
+    def line(cells, paint_result=False) -> str:
+        parts = [fit(cells[0], widths[0]).ljust(widths[0]),
+                 fit(cells[1], widths[1]).ljust(widths[1]),
+                 cells[2].ljust(widths[2])]
+        result = cells[3].ljust(widths[3])
+        if paint_result:
+            result = paint(result, "31;1" if cells[3].startswith("TRUSTS") else
+                           "32" if cells[3].startswith("rejects") else "33", color)
+        parts.append(result)
+        text = " ".join(parts)
+        if show_store:
+            text += " " + fit(cells[4], store_width, middle=True)
+        return text.rstrip()
 
     head = line(titles)
-    out.append(head)
+    out.append(paint(head, "1", color))
     out.append("-" * len(head))
-    out.extend(line(row).rstrip() for row in rows)
+    out.extend(line(row, True) for row in rows)
 
     naive = [r for r in installed if r.verdict == "TRUSTS"]
     patched = [r for r in installed if r.verdict == "PATCHED"]
@@ -1794,21 +1833,24 @@ def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
 
     out.append("")
     if naive:
-        out.append("STILL TRUSTS A COMPROMISED INTERMEDIATE")
+        out.append(paint("STILL TRUSTS A COMPROMISED INTERMEDIATE", "31;1", color))
         for r in naive:
-            out.append(f"  - {r.name} {r.version}: accepts {r.accepted}/{r.total} chains")
+            out.append(fit(f"  - {r.name} {r.version}: accepts {r.accepted}/{r.total} chains",
+                           cols))
             if r.note:
-                out.append(f"    {r.note}")
+                out.append(fit(f"    {r.note}", cols, middle=True))
     else:
         out.append("No installed client accepted a compromised chain.")
 
     if patched:
         out.append("")
-        out.append("Patched by version (could not handshake-test): "
-                   + ", ".join(f"{r.name} {r.version}" for r in patched))
+        out.extend(textwrap.wrap("Patched by version (could not handshake-test): "
+                                 + ", ".join(f"{r.name} {r.version}" for r in patched),
+                                 cols, subsequent_indent="  "))
     if unknown:
         out.append("")
-        out.append("Unresolved: " + ", ".join(f"{r.name} {r.version}".strip() for r in unknown))
+        out.extend(textwrap.wrap("Unresolved: " + ", ".join(
+            f"{r.name} {r.version}".strip() for r in unknown), cols, subsequent_indent="  "))
         for r in unknown:
             if r.errors and r.note:
                 out.append(f"  - {r.name}: {r.errors}/{r.total} probes errored: {r.note}")
@@ -1819,22 +1861,22 @@ def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
     if missing:
         out.append("")
         out.append("Not installed / not applicable here:")
-        out.append("  " + ", ".join(r.name for r in missing))
+        out.extend(textwrap.wrap(", ".join(r.name for r in missing), cols,
+                                 initial_indent="  ", subsequent_indent="  "))
 
     electron = next((r for r in results if r.key == "electron" and r.installed and r.items), None)
     if electron:
         out.append("")
-        out.append(f"Electron applications ({len(electron.items)})")
-        width = max(len(item["name"]) for item in electron.items) + 2
+        out.append(f"Electron applications ({len(electron.items)}), by Electron version")
+        width = min(max(len(item["name"]) for item in electron.items), 24) + 1
         version_width = max(len(item["app_version"]) for item in electron.items) + 2
         for item in sorted(electron.items, key=lambda i: (vnum(i["electron"]), i["name"])):
-            status = "patched" if item["patched"] else f"outdated (needs {item['fix']}+)"
-            out.append(
-                f"  {item['name']:<{width}} {item['app_version']:<{version_width}} "
-                f"Electron {item['electron']:<9} {status}"
+            status = "patched" if item["patched"] else f"needs {item['fix']}+"
+            out.append(fit(
+                f"  {fit(item['name'], width):<{width}} {item['app_version']:<{version_width}} "
+                f"{item['electron']:<8} {status}"
                 + (f"   roots g3={item['roots']['g3']} aaa={item['roots']['aaa']}"
-                   if "roots" in item else "")
-            )
+                   if "roots" in item else ""), cols))
 
     out.append("")
     tested = {item["app"] for r in results if r.key == "chromium" and r.method.startswith("live")
@@ -1842,7 +1884,10 @@ def render(results: list[Result], ctx: Ctx, elapsed: float) -> str:
     browsers = [(name, ver) for name, ver, path in installed_browsers() if path not in tested]
     if browsers:
         out.append("Browsers installed (not exercised; they use their own root programmes):")
-        out.append("  " + ", ".join(f"{name} {ver}".strip() for name, ver in browsers))
+        names = ", ".join(f"{name} {ver}".strip().replace(" ", "\u00a0") for name, ver in browsers)
+        out.extend(line.replace("\u00a0", " ") for line in textwrap.wrap(
+            names, cols, initial_indent="  ", subsequent_indent="  "))
+    out.append("")
     out.append(f"finished in {elapsed:.1f}s")
     return "\n".join(out)
 
@@ -1960,7 +2005,8 @@ def main(argv: list[str] | None = None) -> int:
         ctx.stop_lab()
 
     elapsed = time.time() - started
-    print(render(results, ctx, elapsed))
+    print(render(results, ctx, elapsed,
+                 color=sys.stdout.isatty() and not os.environ.get("NO_COLOR")))
 
     if args.json:
         payload = {

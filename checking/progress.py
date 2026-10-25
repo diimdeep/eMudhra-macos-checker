@@ -4,14 +4,13 @@
 
 A background thread redraws the line ten times a second so the spinner and
 the clock move while a slow probe (a JVM start, a Spotlight query) runs.
-Paths are never cut: when the text is wider than the terminal it wraps, and
-the next redraw moves the cursor back up over every row it used.  Disabled
+Text wider than the terminal is cut in the middle so the line stays on one
+row and the redraw is a plain carriage return.  Disabled
 when stderr is not a terminal, so piped and redirected output stay clean.
 """
 
 from __future__ import annotations
 
-import math
 import shutil
 import sys
 import threading
@@ -46,6 +45,8 @@ class Progress:
         with self._lock:
             self._step = f"[{index:>{width}}/{total}] {label:<9}"
             self._detail = ""
+        if self._thread is not None:
+            self._draw()
 
     def detail(self, text: str) -> None:
         with self._lock:
@@ -77,9 +78,12 @@ class Progress:
         clock = f"{time.monotonic() - self._started:5.1f}s"
         columns = max(shutil.get_terminal_size((100, 20)).columns, 1)
         text = f"{SPINNER[self._tick % len(SPINNER)]} {step} {clock}  {detail}".rstrip()
+        if len(text) >= columns:
+            keep = columns - 2
+            text = text[:keep // 2] + "…" + text[len(text) - (keep - keep // 2):]
         sys.stderr.write(self._rewind() + text)
         sys.stderr.flush()
-        self._rows = max(1, math.ceil(len(text) / columns))
+        self._rows = 1
 
 
 progress = Progress()
