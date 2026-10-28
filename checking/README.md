@@ -57,6 +57,7 @@ check where the client has a readable bundle.
 | `go` | Go | `crypto/x509` system pool | handshake (compiled `net/http` client) |
 | `java` | every JVM | `java_home` default, `/Library/Java/JavaVirtualMachines`, `~/Library/Java/JavaVirtualMachines` (JetBrains `jbr-*` included) | handshake per JVM |
 | `ruby` | Ruby | `OpenSSL::X509::DEFAULT_CERT_FILE` | handshake (`Net::HTTP`) |
+| `git` | every git executable: `PATH`, Xcode, Command Line Tools, Homebrew, MacPorts, app bundles (Fork, Sublime Merge, ...) | libcurl, with your `~/.gitconfig` | handshake (`git ls-remote https://localhost:PORT/check.git`) |
 | `nss` | Homebrew NSS | built-in roots | version |
 | `electron` | Electron apps | app bundles in `/Applications` and `~/Applications`, up to 3 folders deep | version per app; `--deep` adds root markers |
 | `sublime` | Sublime Text plugin host | `Sublime Text*.app` in `/Applications` and `~/Applications`, up to 3 folders deep; bundled certifi | bundle |

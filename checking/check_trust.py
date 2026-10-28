@@ -1682,6 +1682,111 @@ def t_os_package(ctx: Ctx, key: str, name: str, distro: str) -> Result:
     return Result(key, name, version="", group="ca-store")
 
 
+def git_candidates() -> list[Path]:
+    """Every git executable this Mac can run: PATH, toolchains, package managers, app bundles."""
+    found: list[Path] = []
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if folder:
+            found.append(Path(folder) / "git")
+    found += [Path(p) for p in ("/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git",
+                                "/opt/local/bin/git", "/Library/Developer/CommandLineTools/usr/bin/git")]
+    for app in app_bundles():
+        for dirpath, dirnames, filenames in os.walk(app / "Contents"):
+            depth = len(Path(dirpath).relative_to(app / "Contents").parts)
+            # Nested apps are visited on their own; the rest never hold a git.
+            dirnames[:] = [d for d in dirnames if depth < 7 and not d.endswith(".app")
+                           and d not in ("node_modules", "Frameworks", "PlugIns")]
+            if "git" in filenames:
+                found.append(Path(dirpath) / "git")
+
+    # /usr/bin/git is a shim that offers to install the developer tools when
+    # they are missing; only run it when they are present.
+    shim_ok = sh(["xcode-select", "-p"], timeout=5).rc == 0
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in found:
+        if not (path.is_file() and os.access(path, os.X_OK)):
+            continue
+        if str(path) == "/usr/bin/git" and not shim_ok:
+            continue
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append(path)
+    return result
+
+
+def git_exec_path(git: Path) -> Path | None:
+    """Directory holding git-remote-https for this git, or None if it has none.
+
+    Bundled gits (Fork) bake in a prefix such as /usr/local/git, so the helper
+    is looked up next to the binary first.
+    """
+    for folder in (git.resolve().parent.parent / "libexec" / "git-core",
+                   git.resolve().parent.parent / "git" / "libexec" / "git-core"):
+        if (folder / "git-remote-https").is_file():
+            return folder
+    reported = Path(first_line(sh([str(git), "--exec-path"], timeout=10).out) or "/nonexistent")
+    return reported if (reported / "git-remote-https").is_file() else None
+
+
+def p_git(git: Path, exec_path: Path, chain, timeout):
+    """`git ls-remote` against the lab, with the user's own git configuration."""
+    env = os.environ.copy()
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_CURL_VERBOSE="1", GIT_EXEC_PATH=str(exec_path))
+    r = sh([str(git), "-c", "credential.helper=", "ls-remote", chain.url + "check.git"],
+           timeout=timeout + 6, env=env)
+    text = r.out + r.err
+    # The lab answers with plain text, so git itself fails after the handshake;
+    # a completed TLS handshake is what counts.
+    handshook = "SSL certificate verify ok" in text or "SSL connection using" in text
+    fatal = next((l for l in text.splitlines() if l.startswith(("fatal:", "error:"))), "")
+    return classify(r.rc == 0 or (handshook and not REJECT_RE.search(fatal)),
+                    fatal or first_line(r.err) or f"exit {r.rc}")
+
+
+def git_info(git: Path) -> tuple[str, str]:
+    """(version, TLS library) from `git version --build-options`."""
+    r = sh([str(git), "version", "--build-options"], timeout=10)
+    lines = r.out.splitlines()
+    version = re.sub(r"^git version ", "", lines[0]).strip() if lines else ""
+    backend = next((l.split(":", 1)[1].strip() for l in lines if l.startswith("libcurl")), "")
+    return version, f"libcurl {backend}" if backend else ""
+
+
+def t_git(ctx: Ctx) -> list[Result]:
+    progress.detail("looking for git executables")
+    gits = git_candidates()
+    if not gits:
+        return [Result("git", "git", installed=False)]
+    results: list[Result] = []
+    for git in gits:
+        version, lib = git_info(git)
+        exec_path = git_exec_path(git)
+        if exec_path is None:
+            results.append(Result("git", f"git {version} ({git.parent.parent.parent.name})",
+                                  installed=False,
+                                  note=f"{git} has no git-remote-https, so it cannot reach https remotes"))
+            continue
+        label = f"git {version}".strip()
+        try:
+            where = f"~/{git.relative_to(Path.home())}"
+        except ValueError:
+            where = str(git)
+        if not (ctx.mode == "local" and ctx.servers):
+            results.append(Result("git", label, version=version.split(" ")[0], store=where,
+                                  method="n/a", note="needs the local lab", group="runtime"))
+            continue
+        accepted, total, detail, errors = ctx.run_probe(
+            lambda chain, timeout, git=git, ep=exec_path: p_git(git, ep, chain, timeout), where)
+        results.append(Result("git", label, version=version.split(" ")[0], store=where,
+                              method="live handshake, local lab", accepted=accepted,
+                              total=total, errors=errors, note=f"{lib}; {detail}".strip("; "),
+                              group="runtime", items=[{"path": str(git)}]))
+    return results
+
+
 TECHS = [
     ("macos", t_macos), ("homebrew", t_homebrew), ("openssl", t_openssl),
     ("curl", t_curl), ("python", t_python_ssl), ("certifi", t_certifi),
@@ -1689,7 +1794,7 @@ TECHS = [
     ("bun", t_bun), ("deno", t_deno), ("go", t_go), ("java", t_java), ("ruby", t_ruby),
     ("nss", t_nss), ("electron", t_electron), ("sublime", t_sublime),
     ("pythons", t_pythons), ("apps", t_app_bundles), ("venvs", t_venvs),
-    ("chromium", t_chromium),
+    ("chromium", t_chromium), ("git", t_git),
     ("rust", t_rust),
     ("composer", t_composer), ("elixir", t_elixir), ("perl", t_perl),
     ("cfssl", t_cfssl),
@@ -1727,6 +1832,7 @@ FIXED_LOOKUP = {
     "apps": None,
     "venvs": None,
     "chromium": None,
+    "git": None,
     "rust": "Rust rustls-webpki",
     "composer": "Composer ca-bundle",
     "elixir": "Elixir castore",
