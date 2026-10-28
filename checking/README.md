@@ -32,6 +32,7 @@ python3 checking/check_trust.py --json          # write checking/report.json
 | `--scan DIR` | also look for certifi copies under DIR (repeatable; home is always scanned) |
 | `--top N` | test only the first N chains (debugging) |
 | `--timeout S` | per-probe timeout (default 8) |
+| `--poisoned` | self-test: extend every client's trust with the lab roots, require `TRUSTS` from each poisonable client, exit 0 if they all do; writes `report-poisoned.json` |
 | `--no-progress` | do not draw the progress line (it is off anyway when stderr is not a terminal) |
 
 ## Targets

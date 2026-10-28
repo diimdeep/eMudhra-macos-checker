@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import platform
@@ -60,6 +61,23 @@ from lab import Lab, LabError, resolve_chains, split_pem, sweep_stale  # noqa: E
 from progress import progress  # noqa: E402
 
 VERSION = "1.0"
+
+# Filled by --poisoned: {"roots": PEM of the roots above the lab chains,
+# "spki": [base64 SHA-256 of each chain certificate's public key]}.  Empty on a real run.
+POISON: dict = {}
+
+# Rows a poisoned run cannot steer.  These runtimes verify through Security.framework
+# on macOS, which ignores SSL_CERT_FILE and reports the intermediates as revoked.
+POISON_EXEMPT = ({"macos", "node", "npm", "bun", "deno", "go"}
+                 if sys.platform == "darwin" else set())
+
+
+def poison_exempt(r: "Result") -> bool:
+    # Yandex's fork ignores --ignore-certificate-errors-spki-list.
+    return r.key in POISON_EXEMPT or (r.key == "chromium" and ("Yandex" in r.name
+                                                               or "Яндекс" in r.name))
+
+SYSTEM_ROOTS = "/System/Library/Keychains/SystemRootCertificates.keychain"
 
 # ---------------------------------------------------------------------------
 # small helpers
@@ -248,8 +266,10 @@ def classify(ok: bool, detail: str) -> tuple[bool | None, str]:
 
 
 def p_curl(chain, timeout):
-    r = sh(["curl", "-sS", "-m", str(timeout), "-o", "/dev/null",
-            "-w", "%{http_code}", chain.url], timeout=timeout + 4)
+    cmd = ["curl", "-sS", "-m", str(timeout), "-o", "/dev/null", "-w", "%{http_code}"]
+    if POISON:
+        cmd += ["--cacert", str(POISON["roots"])]
+    r = sh(cmd + [chain.url], timeout=timeout + 4)
     detail = first_line(r.err) or f"exit {r.rc}"
     return classify(r.rc == 0 and r.out.strip() == "200", detail)
 
@@ -288,7 +308,7 @@ def p_certifi(chain, timeout):
         import certifi
     except ImportError:
         return None, "certifi not installed"
-    return _python_probe(chain, timeout, certifi.where())
+    return _python_probe(chain, timeout, str(POISON.get("roots") or certifi.where()))
 
 
 NODE_SCRIPT = """
@@ -377,9 +397,12 @@ def p_interpreter(python: str, chain, timeout, cafile: str | None = None):
 
 
 def p_ruby(chain, timeout):
+    # LibreSSL's Ruby ignores SSL_CERT_FILE, so the poison goes in as ca_file.
+    opts = f", ca_file: {str(POISON['roots'])!r}" if POISON else ""
     script = (
         "require 'net/http'; require 'uri'; "
-        f"begin; Net::HTTP.get_response(URI({chain.url!r})); puts 'OK'; "
+        f"begin; u = URI({chain.url!r}); "
+        f"Net::HTTP.start(u.host, u.port, use_ssl: true{opts}) {{ |h| h.get('/') }}; puts 'OK'; "
         "rescue => e; puts 'ERR ' + e.class.to_s + ': ' + e.message; exit 1; end"
     )
     r = sh(["ruby", "-e", script], timeout=timeout + 6)
@@ -523,6 +546,7 @@ class Ctx:
         self.chain_files = sorted(self.chains_dir.glob("*.pem"))
         self.openssl = shutil.which("openssl") or "openssl"
         self.servers = []
+        self.poison_dir: Path | None = None
         self.limited = bool(args.top)
         self._local: dict[str, Summary] | None = None
         self._java: dict[str, Summary] = {}
@@ -549,12 +573,78 @@ class Ctx:
     def stop_lab(self):
         if getattr(self, "lab", None):
             self.lab.cleanup()
+        if self.poison_dir:
+            shutil.rmtree(self.poison_dir, ignore_errors=True)
         for stale in self.cache.glob("keychain-*.pem"):  # left by older versions
             stale.unlink(missing_ok=True)
 
     # -- bundle check ---------------------------------------------------
 
+    def poisoned_bundle(self, bundle: Path) -> Path:
+        """`bundle` plus the lab roots, so `openssl verify` accepts the chains."""
+        merged = self.poison_dir / f"bundle-{len(list(self.poison_dir.glob('bundle-*')))}.pem"
+        merged.write_text(bundle.read_text(errors="replace").rstrip() + "\n"
+                          + Path(POISON["roots"]).read_text())
+        return merged
+
+    def poison(self) -> None:
+        """Extend every client's trust with the roots above the lab chains.
+
+        The system is untouched: only environment variables, command-line
+        flags and temporary files change.  Each client that follows them must
+        then report TRUSTS, which exercises the verdict, summary, JSON and
+        exit-status code that a healthy machine never reaches.
+        """
+        if not (sys.platform == "darwin" and have("security")):
+            raise LabError("--poisoned needs the macOS system root keychain")
+        self.poison_dir = Path(tempfile.mkdtemp(prefix="poison-", dir=CACHE))
+        roots: list[str] = []
+        spki: list[str] = []
+        for chain_file in self.chain_files:
+            blocks = split_pem(chain_file.read_text())
+            top = blocks[-1]
+            names = sh([self.openssl, "x509", "-noout", "-subject", "-issuer"], input_text=top).out
+            subject, issuer = (m.group(1).strip() for m in re.finditer(r"CN\s*=\s*([^,\n]+)", names))
+            if subject == issuer:
+                found = [top]
+            else:
+                found = split_pem(sh(["security", "find-certificate", "-a", "-p", "-c", issuer,
+                                      SYSTEM_ROOTS], timeout=20).out)
+            if not found:
+                raise LabError(f"root '{issuer}' for {chain_file.name} is not in the system keychain")
+            roots += [c for c in found if c not in roots]
+            for block in blocks[1:]:
+                pub = subprocess.run([self.openssl, "x509", "-pubkey", "-noout"], input=block,
+                                     capture_output=True, text=True).stdout
+                der = subprocess.run([self.openssl, "pkey", "-pubin", "-outform", "DER"],
+                                     input=pub.encode(), capture_output=True).stdout
+                digest = base64.b64encode(hashlib.sha256(der).digest()).decode()
+                if digest not in spki:
+                    spki.append(digest)
+        bundle = self.poison_dir / "roots.pem"
+        bundle.write_text("\n".join(roots) + "\n")
+        POISON.update(roots=bundle, spki=spki)
+
+        env = {name: str(bundle) for name in ("SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+                                              "NODE_EXTRA_CA_CERTS", "DENO_CERT",
+                                              "REQUESTS_CA_BUNDLE")}
+        homes = java_homes()
+        keytool = homes[0]["home"] / "bin" / "keytool" if homes else None
+        if keytool and keytool.exists():
+            store = self.poison_dir / "trust.jks"
+            for i, pem in enumerate(roots):
+                one = self.poison_dir / f"root-{i}.pem"
+                one.write_text(pem + "\n")
+                sh([str(keytool), "-importcert", "-noprompt", "-alias", f"poison{i}", "-file",
+                    str(one), "-keystore", str(store), "-storepass", "changeit"], timeout=30)
+            if store.is_file():
+                env["JAVA_TOOL_OPTIONS"] = (f"-Djavax.net.ssl.trustStore={store} "
+                                            "-Djavax.net.ssl.trustStorePassword=changeit")
+        os.environ.update(env)
+
     def bundle_counts(self, bundle: Path) -> tuple[int, int]:
+        if POISON:
+            bundle = self.poisoned_bundle(bundle)
         accepted = 0
         total = len(self.chain_files)
         for i, chain in enumerate(self.chain_files, 1):
@@ -668,6 +758,8 @@ class Ctx:
             for chain in self.servers:
                 blocks = split_pem(chain.path.read_text())[1:]  # drop the minted leaf
                 cmd = ["security", "verify-cert", "-p", "ssl", "-l", "-L"]
+                if POISON:
+                    cmd += ["-r", str(POISON["roots"])]
                 for i, block in enumerate(blocks):
                     path = Path(tmp) / f"{chain.name}-{i}.pem"
                     path.write_text(block + "\n")
@@ -1350,7 +1442,9 @@ def t_pythons(ctx: Ctx) -> list[Result]:
         lib = openssl.split()[0] + " " + (openssl.split()[1] if len(openssl.split()) > 1 else "")
         if ctx.mode == "local" and ctx.servers:
             accepted, total, detail, errors = ctx.run_probe(
-                lambda chain, timeout: p_interpreter(str(python), chain, timeout), str(python))
+                lambda chain, timeout: p_interpreter(
+                    str(python), chain, timeout, str(POISON["roots"]) if POISON else None),
+                str(python))
             results.append(Result("pythons", label, version=f"{version} / {lib.strip()}",
                                   store=cafile, method="live handshake, local lab",
                                   accepted=accepted, total=total, errors=errors,
@@ -1561,7 +1655,9 @@ def load_page(binary: Path, profile: Path, url: str, timeout: float) -> tuple[st
     proc = subprocess.Popen(
         [str(binary), "--headless=new", f"--user-data-dir={profile}", "--no-first-run",
          "--no-default-browser-check", "--disable-gpu", "--disable-extensions",
-         "--remote-debugging-port=0", "about:blank"],
+         "--remote-debugging-port=0"]
+        + ([f"--ignore-certificate-errors-spki-list={','.join(POISON['spki'])}"] if POISON else [])
+        + ["about:blank"],
         stdout=subprocess.DEVNULL, stderr=log, text=True, start_new_session=True)
     try:
         port_file = profile / "DevToolsActivePort"
@@ -1919,7 +2015,10 @@ class Table:
 
 def render_header(ctx: Ctx, table: Table) -> str:
     cols = table.cols
-    out = ["", "eMudhra intermediate CA compromise - local trust check", "=" * min(cols, 78),
+    out = ["", "eMudhra intermediate CA compromise - local trust check", "=" * min(cols, 78)]
+    if POISON:
+        out.append("POISONED RUN: client trust was extended with the lab roots, results are synthetic")
+    out += [
            f"started   {time.strftime('%Y-%m-%d %H:%M:%S %z')}",
            f"mode      {ctx.mode}" + (
                f"  ({len(ctx.servers)} chains on 127.0.0.1 and ::1)" if ctx.servers else
@@ -1944,7 +2043,8 @@ def render_summary(results: list[Result], ctx: Ctx, elapsed: float, table: Table
 
     out.append("")
     if naive:
-        out.append(paint("STILL TRUSTS A COMPROMISED INTERMEDIATE", "31;1", color))
+        out.append(paint("TRUSTS (expected, this run is poisoned)" if POISON
+                         else "STILL TRUSTS A COMPROMISED INTERMEDIATE", "31;1", color))
         for r in naive:
             out.append(fit(f"  - {r.name} {r.version}: accepts {r.accepted}/{r.total} chains",
                            cols))
@@ -2000,6 +2100,27 @@ def render_summary(results: list[Result], ctx: Ctx, elapsed: float, table: Table
             names, cols, initial_indent="  ", subsequent_indent="  "))
     out.append("")
     out.append(f"finished in {elapsed:.1f}s")
+    return "\n".join(out)
+
+
+def poison_failures(results: list[Result]) -> list[Result]:
+    """Tested rows that should have followed the poison and did not."""
+    return [r for r in results
+            if r.installed and r.accepted is not None and not poison_exempt(r)
+            and not (r.verdict == "TRUSTS" and r.accepted == r.total)]
+
+
+def render_poison_report(results: list[Result], stray: list[Result]) -> str:
+    tested = [r for r in results if r.installed and r.accepted is not None
+              and not poison_exempt(r)]
+    out = ["", f"Poisoned self-test: {len(tested) - len(stray)}/{len(tested)} tested rows "
+           "followed the poison"]
+    for r in stray:
+        out.append(f"  FAIL {r.name}: {accepted_text(r)}" + (f" ({r.note})" if r.note else ""))
+    exempt = [r.name for r in results if r.installed and poison_exempt(r)]
+    if exempt:
+        out.append("  not poisonable here: " + ", ".join(exempt))
+    out.append("  PASS" if not stray else "  a FAIL row means its probe or its poison hook is wrong")
     return "\n".join(out)
 
 
@@ -2060,11 +2181,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scan", action="append", default=[], metavar="DIR",
                         help="also look for certifi copies (venvs) under DIR; repeatable. "
                         "Home is always scanned")
+    parser.add_argument("--poisoned", action="store_true",
+                        help="self-test: extend every client's trust with the lab roots and "
+                        "require every poisonable client to report TRUSTS (exit 0 if so)")
     parser.add_argument("--no-progress", action="store_true",
                         help="do not draw the progress line on stderr")
     parser.add_argument("--only", default="",
                         help="comma-separated tech keys, e.g. java or java,curl")
     args = parser.parse_args(argv)
+
+    if args.poisoned and args.mode != "local":
+        parser.error("--poisoned needs --mode local")
 
     wanted = {part.strip() for part in args.only.split(",") if part.strip()}
 
@@ -2098,6 +2225,13 @@ def main(argv: list[str] | None = None) -> int:
                 print("hint: pass --keys PATH (zip or directory with the eight .pem/.key pairs), "
                       "or use --mode offline", file=sys.stderr)
                 return 2
+        if args.poisoned:
+            try:
+                ctx.poison()
+            except LabError as exc:
+                progress.done()
+                print(f"error: {exc}", file=sys.stderr)
+                return 2
         progress.emit(render_header(ctx, view))
         for index, (key, tech) in enumerate(selected, 1):
             progress.step(index, len(selected), key)
@@ -2122,8 +2256,15 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = time.time() - started
     print(render_summary(results, ctx, elapsed, view))
 
+    stray = poison_failures(results) if args.poisoned else []
+    if args.poisoned:
+        print(render_poison_report(results, stray))
+
     if args.json:
+        if args.poisoned and args.json == str(HERE / "report.json"):
+            args.json = str(HERE / "report-poisoned.json")
         payload = {
+            "poisoned": bool(args.poisoned),
             "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "version": VERSION,
             "mode": args.mode,
@@ -2135,6 +2276,8 @@ def main(argv: list[str] | None = None) -> int:
         path.write_text(json.dumps(payload, indent=2) + "\n")
         print(f"\nJSON written to {path}")
 
+    if args.poisoned:
+        return 1 if stray else 0
     return 1 if any(r.verdict == "TRUSTS" for r in results) else 0
 
 
